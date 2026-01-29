@@ -1,4 +1,4 @@
-# Hidden Liquidity Inference Framework for DWTS Fan Vote Estimation
+# Hidden Liquidity Inference Framework for DWTS Fan Vote Estimation (v2.0)
 
 > **核心思想**：将选秀节目建模为**双边信息不对称市场**，评委打分是"公开报价"，粉丝投票是"暗池订单"。通过分析选手的"抗跌性"——即低分时的存活概率——逆向破解隐藏的粉丝投票分布。
 
@@ -19,324 +19,503 @@
 
 ### 1.2 核心假设
 
-**假设 H1 (理性淘汰)**：每周综合得分最低的选手被淘汰。
+**H1 (理性淘汰)**：每周综合得分最低者被淘汰（机制相关）。
 
-**假设 H2 (隐藏流动性)**：粉丝投票 $V_{i,w}$ 不可直接观测，但其效应体现在选手的"存活韧性"中。
+**H2 (隐藏流动性)**：粉丝投票 $V_{i,w}$ 不可直接观测，但其效应体现在选手的"存活韧性"中。
 
-**假设 H3 (机制已知)**：
-- **Rank-Based (S1-2, S28-34)**：$R_{i,w} = \text{JudgeRank}_i + \text{FanRank}_i$
-- **Percent-Based (S3-27)**：$R_{i,w} = \frac{J_{i,w}}{\sum_j J_{j,w}} + \frac{V_{i,w}}{\sum_j V_{j,w}}$
+**H3 (噪声容忍)**：允许约束松弛 $\delta \in [0, 0.5]$，以应对裁判偏差、规则扰动、平票打破等现实情况。
 
 ---
 
-## 二、算法核心：隐藏流动性的区间推断
+## 二、投票机制精确刻画
 
-### 2.1 阶段一：构建约束系统 (Constraint System)
+### 2.1 三种机制定义
 
-对于每周的淘汰事件，我们可以建立**不等式约束**：
+| 机制 | 适用季 | 综合分公式 | 淘汰规则 |
+|------|--------|-----------|----------|
+| **Rank** | S1-2 | $C_i = \text{JudgeRank}_i + \text{FanRank}_i$ | $\arg\max C_i$ 被淘汰 |
+| **Percent** | S3-27 | $C_i = \frac{J_i}{\sum_j J_j} + \frac{V_i}{\sum_j V_j}$ | $\arg\min C_i$ 被淘汰 |
+| **Rank+JudgePick** | S28-34 | 同 Rank 取 $\text{Bottom}_2$ | 评委从 $\text{Bottom}_2$ 中二选一淘汰 |
 
-**定义**：设第 $w$ 周有 $n_w$ 名选手参赛，淘汰者为 $e_w$。
-
-**约束**：对于所有存活者 $i \neq e_w$：
-$$
-\text{CombinedScore}(i, w) > \text{CombinedScore}(e_w, w)
-$$
-
-展开（以 Rank-Based 为例）：
-$$
-\text{JudgeRank}_i + \text{FanRank}_i < \text{JudgeRank}_{e_w} + \text{FanRank}_{e_w}
-$$
-
-由于 $V_{i,w}$ 未知，但 Rank 是 $V$ 的函数，这构成了一个**关于粉丝票序的约束系统**。
-
-### 2.2 阶段二：可行域枚举与蒙特卡洛采样
-
-**目标**：找到所有满足约束的 $(V_{1,w}, V_{2,w}, ..., V_{n_w,w})$ 排列组合。
-
-**方法 A：排列约束求解 (Exact but Exponential)**
-```
-For each week w:
-    1. 获取评委分排名 JudgeRank[1..n]
-    2. 枚举所有可能的 FanRank 排列 Π
-    3. 对每个 Π, 计算 CombinedRank
-    4. 保留使淘汰者 e_w 在 CombinedRank 中排最后的 Π
-    5. 这些 Π 构成"可行粉丝投票序集"
-```
-
-**方法 B：逆向贝叶斯采样 (Scalable)**
-```
-1. 假设 V ~ Prior(选手属性, 历史表现)
-2. 使用 MCMC/ABC 采样，接受满足淘汰约束的样本
-3. 得到 V 的后验分布
-```
-
-### 2.3 阶段三：流动性指标构建
-
-定义选手 $i$ 的**隐藏流动性深度 (Hidden Liquidity Depth, HLD)**：
-
-$$
-\text{HLD}_{i,w} = \mathbb{E}[\text{FanRank}_i \mid \text{Constraints Satisfied}]
-$$
-
-解释：
-- HLD 越小 → 粉丝票排名越靠前 → 隐藏支持越强
-- HLD 越大 → 主要靠评委分存活
-
-**极端案例诊断**：
-| 选手类型 | 评委分排名 | HLD | 诊断 |
-|----------|------------|-----|------|
-| Bristol Palin | 几乎垫底 (12次) | 极小 | 超强铁粉群体 |
-| 技术型冠军 | 顶尖 | 中等 | 评委与粉丝一致 |
-| "冷门"淘汰 | 中游 | 极大 | 粉丝基础薄弱 |
-
----
-
-## 三、分层模型架构
+### 2.2 Rank+JudgePick 两阶段约束
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Layer 3: 争议分析                         │
-│  - 针对 Jerry Rice, Billy Ray Cyrus, Bristol Palin, Bobby   │
-│    Bones 等争议选手，进行流动性压力测试                        │
-│  - 对比 Rank vs Percent 机制下的结果差异                      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│                    Layer 2: 粉丝票推断                        │
-│  - 输入: 每周评委分、存活/淘汰标签、选手属性                    │
-│  - 方法: 约束满足 + MCMC 采样                                  │
-│  - 输出: V_{i,w} 的区间估计 [V_low, V_high]                   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│                    Layer 1: 数据预处理                        │
-│  - 解析评委分（处理 N/A, 多舞平均, bonus 分）                   │
-│  - 提取淘汰事件序列                                            │
-│  - 识别投票机制切换点 (S2→S3, S27→S28)                         │
-└─────────────────────────────────────────────────────────────┘
+Stage 1: 确定 Bottom2
+    Bottom2 = {a, b} s.t. C_a, C_b 为最大两个
+
+Stage 2: 评委裁决
+    eliminated ∈ Bottom2  (由评委现场投票决定)
 ```
 
----
+**约束形式化**：
+- 对所有 $k \notin \text{Bottom}_2$：$C_k < \min(C_a, C_b) - \delta$
+- $\text{eliminated} \in \{a, b\}$
 
-## 四、模型 M1：基于约束的排列推断
-
-### 4.1 输入
-- $J_{i,w}$: 选手 $i$ 在第 $w$ 周的评委总分
-- $E_w$: 第 $w$ 周被淘汰选手的 ID
-- 投票机制 $M \in \{\text{Rank}, \text{Percent}\}$
-
-### 4.2 算法伪代码
+### 2.3 机制切换表
 
 ```python
-def infer_fan_votes_week(judge_scores, eliminated_id, mechanism):
+SEASON_MODE = {
+    1: "Rank", 2: "Rank",
+    **{s: "Percent" for s in range(3, 28)},
+    **{s: "Rank+JudgePick" for s in range(28, 35)}
+}
+```
+
+---
+
+## 三、数据处理与事件序列
+
+### 3.1 清洗规则
+
+| 异常类型 | 处理方法 |
+|----------|----------|
+| **N/A 评分** | 缺第4评委 → 用前3评委均值；整周缺失 → 标记 `mask=True` |
+| **多舞平均** | 原数据已均值化，直接使用（如 8.5 表示两舞均分） |
+| **Bonus 分** | 均匀分摊至各评委列（如 bonus=1.5 分给3评委，各加0.5） |
+| **淘汰后 0 分** | 用于识别淘汰周次；建模时对后续周屏蔽该选手 |
+| **周数不一致** | 按实际参赛周数构建事件序列，不强制对齐 |
+
+### 3.2 异常周处理
+
+| 事件类型 | 识别方法 | 处理策略 |
+|----------|----------|----------|
+| **无淘汰周** | 当周无人变0分 | 跳过该周约束 |
+| **多人淘汰** | 当周多人变0分 | 联合约束：所有淘汰者均为最差 |
+| **中途退赛** | results 含 "Withdrew" | 标记 `withdrawal=True`，不计入约束 |
+| **全明星赛 S15** | 特殊赛季 | 单独处理或排除 |
+
+### 3.3 事件表结构 (per season)
+
+```python
+@dataclass
+class WeekEvent:
+    season: int
+    week: int
+    contestants_alive: List[str]      # 当周存活选手
+    judge_scores: Dict[str, float]    # 评委总分
+    eliminated: Optional[str]         # 淘汰者 (None if no elimination)
+    bottom2: Optional[Tuple[str,str]] # S28+ 底两名
+    mechanism: str                    # Rank | Percent | Rank+JudgePick
+    is_finale: bool                   # 是否决赛周
+    special_flags: Set[str]           # {"no_elim", "double_elim", "withdrawal"}
+```
+
+---
+
+## 四、约束构建与求解策略
+
+### 4.1 约束系统形式化
+
+**Rank 模式约束**：
+$$
+\forall i \neq e_w: \quad \text{JudgeRank}_i + \text{FanRank}_i < \text{JudgeRank}_{e_w} + \text{FanRank}_{e_w} - \delta
+$$
+
+**Percent 模式约束**：
+$$
+\forall i \neq e_w: \quad \frac{J_i}{\sum J} + \frac{V_i}{\sum V} > \frac{J_{e_w}}{\sum J} + \frac{V_{e_w}}{\sum V} + \delta
+$$
+
+**Rank+JudgePick 约束**：
+$$
+\begin{cases}
+e_w \in \text{Bottom}_2 \\
+\forall k \notin \text{Bottom}_2: C_k < \min(C_a, C_b) - \delta
+\end{cases}
+$$
+
+### 4.2 分治求解策略
+
+| 选手数 $n$ | 策略 | 复杂度 |
+|------------|------|--------|
+| $n \leq 6$ | 全排列枚举 | $O(n!)$ ≤ 720 |
+| $6 < n \leq 12$ | CP-SAT 约束求解 | $O(\text{poly}(n))$ |
+| $n > 12$ | MCMC/SMC 采样 | $O(T \cdot n)$ |
+
+### 4.3 CP-SAT 形式化 (Google OR-Tools)
+
+```python
+def solve_week_cpsat(judge_scores, eliminated, mechanism, relax=0.0):
     """
-    推断单周粉丝投票的可行排列
+    使用 CP-SAT 求解可行粉丝排名
     
-    Returns:
-        feasible_fan_rankings: List of all valid fan vote orderings
+    Variables:
+        fan_rank[i] ∈ [1, n]  for each contestant i
+    
+    Constraints:
+        AllDifferent(fan_rank)
+        combined[eliminated] >= combined[i] + relax  for all i ≠ eliminated
+    """
+    from ortools.sat.python import cp_model
+    
+    model = cp_model.CpModel()
+    n = len(judge_scores)
+    contestants = list(judge_scores.keys())
+    
+    # Variables: fan_rank[i] ∈ [1, n]
+    fan_rank = {c: model.NewIntVar(1, n, f'fan_{c}') for c in contestants}
+    
+    # AllDifferent constraint
+    model.AddAllDifferent(list(fan_rank.values()))
+    
+    # Judge ranks (1 = best)
+    sorted_by_judge = sorted(contestants, key=lambda c: -judge_scores[c])
+    judge_rank = {c: i+1 for i, c in enumerate(sorted_by_judge)}
+    
+    # Combined score constraint
+    for c in contestants:
+        if c != eliminated:
+            # combined[elim] > combined[c]
+            # judge_rank[elim] + fan_rank[elim] > judge_rank[c] + fan_rank[c]
+            model.Add(
+                judge_rank[eliminated] + fan_rank[eliminated] 
+                > judge_rank[c] + fan_rank[c] + int(relax)
+            )
+    
+    # Enumerate all solutions
+    solver = cp_model.CpSolver()
+    solution_collector = SolutionCollector(fan_rank, contestants)
+    solver.SearchForAllSolutions(model, solution_collector)
+    
+    return solution_collector.solutions
+```
+
+### 4.4 MCMC 采样 (大 $n$ 场景)
+
+```python
+def mcmc_sample_votes(judge_scores, eliminated, mechanism, 
+                      T=5000, burn=1000, thin=5):
+    """
+    Metropolis-Hastings 采样粉丝排名
+    
+    Proposal: 交换两个选手的 fan_rank
+    Acceptance: 满足约束 → accept; 否则以 exp(-λ·violation) 概率接受
     """
     n = len(judge_scores)
     contestants = list(judge_scores.keys())
-    judge_ranks = compute_ranks(judge_scores)  # 越高分排名越小(好)
     
-    feasible = []
+    # Initialize: fan_rank inversely proportional to judge_score
+    current = initialize_from_prior(judge_scores)
+    samples = []
     
-    # 枚举所有 n! 粉丝排名排列
-    for fan_ranks in permutations(range(1, n+1)):
-        fan_rank_dict = dict(zip(contestants, fan_ranks))
+    for t in range(T):
+        # Propose: swap two random ranks
+        i, j = random.sample(range(n), 2)
+        proposal = current.copy()
+        proposal[i], proposal[j] = proposal[j], proposal[i]
         
-        if mechanism == "Rank":
-            combined = {c: judge_ranks[c] + fan_rank_dict[c] for c in contestants}
-        else:  # Percent - 需要假设具体票数,这里用 rank 逆序作为近似
-            combined = compute_percent_combined(judge_scores, fan_rank_dict)
+        # Check constraint satisfaction
+        curr_violation = compute_violation(current, judge_scores, eliminated, mechanism)
+        prop_violation = compute_violation(proposal, judge_scores, eliminated, mechanism)
         
-        # 检验: 淘汰者的combined应该是最高(最差)
-        worst = max(combined.values())
-        if combined[eliminated_id] == worst:
-            # 检查是否唯一最差(避免并列情况)
-            if list(combined.values()).count(worst) == 1:
-                feasible.append(fan_rank_dict)
+        # Acceptance probability
+        if prop_violation == 0:
+            accept = True
+        elif curr_violation == 0:
+            accept = random.random() < math.exp(-LAMBDA * prop_violation)
+        else:
+            accept = random.random() < math.exp(LAMBDA * (curr_violation - prop_violation))
+        
+        if accept:
+            current = proposal
+        
+        if t >= burn and (t - burn) % thin == 0:
+            samples.append(current.copy())
     
-    return feasible
+    return samples
 ```
-
-### 4.3 输出
-对于每个选手 $i$：
-$$
-\hat{V}_{i,w} \in [\min_{\Pi \in \text{Feasible}} \Pi(i), \max_{\Pi \in \text{Feasible}} \Pi(i)]
-$$
 
 ---
 
-## 五、模型 M2：贝叶斯流动性推断
+## 五、贝叶斯流动性推断
 
-### 5.1 先验模型 (Prior)
-
-基于选手属性构建粉丝投票的先验分布：
+### 5.1 层次先验模型
 
 $$
-\log V_{i,w} \sim \mathcal{N}(\mu_i, \sigma^2)
+\log V_{i,w} \sim \mathcal{N}(\mu_{i,w}, \sigma^2)
 $$
 
 其中：
 $$
-\mu_i = \beta_0 + \beta_1 \cdot \text{Industry}_i + \beta_2 \cdot \text{Age}_i + \beta_3 \cdot \text{ProPartner}_i + \beta_4 \cdot J_{i,w}
+\mu_{i,w} = \underbrace{\beta_0}_{\text{intercept}} 
++ \underbrace{\beta_{\text{ind}} \cdot \mathbf{X}_{\text{industry}}}_{\text{行业效应}}
++ \underbrace{\beta_{\text{age}} \cdot \text{Age}_i}_{\text{年龄效应}}
++ \underbrace{\beta_J \cdot J_{i,w}}_{\text{评委分关联}}
++ \underbrace{u_{\text{pro}[i]}}_{\text{舞伴随机效应}}
++ \underbrace{u_{\text{season}}}_{\text{季节随机效应}}
++ \underbrace{\gamma_w}_{\text{周效应}}
++ \underbrace{\phi \cdot \text{Momentum}_{i,w}}_{\text{动量项}}
 $$
 
-### 5.2 似然函数 (Likelihood)
+### 5.2 动态特征
 
+**动量 (Momentum)**：
 $$
-P(\text{Eliminated}_w = e | V_1, ..., V_n) = \mathbb{1}[\arg\max R(V) = e]
+\text{Momentum}_{i,w} = \alpha_1 \cdot \Delta J_{i,w-1} + \alpha_2 \cdot \Delta\text{Rank}_{i,w-1}
 $$
 
-### 5.3 后验推断 (MCMC)
+**争议指示变量**：
+$$
+\text{Controversy}_{i,w} = \mathbb{1}[\text{JudgeRank}_{i,w} \geq n-1 \land S_{i,w} = 1]
+$$
 
-使用 **Approximate Bayesian Computation (ABC)** 或 **Gibbs Sampling**：
+### 5.3 舞伴层次效应
 
 ```
-Initialize V^(0) from prior
-For t = 1 to T:
-    For each contestant i:
-        Propose V'_i ~ q(V_i | V^(t-1)_i)
-        Compute acceptance ratio α based on constraint satisfaction
-        Accept/Reject with probability min(1, α)
-    V^(t) = updated votes
-Return posterior samples {V^(1), ..., V^(T)}
-```
+pro_effect[p] ~ N(0, τ²_pro)
 
-### 5.4 后验统计量
+Top-tier pros (Derek Hough, Mark Ballas, Val, etc.):
+    Expected u_pro > 0 (boost fan votes)
 
-- **点估计**：$\hat{V}_{i,w} = \text{median}(V^{(t)}_{i,w})$
-- **置信区间**：$95\% \text{CI} = [Q_{2.5\%}, Q_{97.5\%}]$
-- **流动性深度**：$\text{HLD}_i = \text{median}(\text{FanRank}_i)$
-
----
-
-## 六、模型 M3：选手属性影响因子分析
-
-### 6.1 目标
-回答题目要求：*"How much do such things impact how well a celebrity will do?"*
-
-### 6.2 模型结构
-
-**第一阶段**：推断 $\hat{V}_{i,w}$（使用 M1 或 M2）
-
-**第二阶段**：回归分析
-$$
-\hat{V}_{i,w} = f(\text{Industry}, \text{Age}, \text{HomeState}, \text{ProPartner}, \text{Week}, \epsilon)
-$$
-
-使用：
-- **XGBoost + SHAP**：非线性关系 + 可解释性
-- **Hierarchical Linear Model**：控制季节效应
-
-### 6.3 关键假设检验
-
-| 假设 | 模型检验 |
-|------|----------|
-| Athletes get more fan votes | $\beta_{\text{Athlete}} > 0$ |
-| Younger celebrities are more popular | $\beta_{\text{Age}} < 0$ |
-| Top pro dancers boost fan votes | $\beta_{\text{ProPartner:Derek Hough}} > 0$ |
-| Fan votes and judge scores are correlated | $\text{Corr}(\hat{V}, J) > 0$ |
-
----
-
-## 七、模型 M4：投票机制公平性分析
-
-### 7.1 目标
-回答题目要求：*"If differences in outcomes exist, does one method seem to favor fan votes more than the other?"*
-
-### 7.2 反事实分析 (Counterfactual Analysis)
-
-对于每季，使用推断的 $\hat{V}$：
-```
-For each season s:
-    For each week w:
-        Compute Rank-Based elimination: e_rank
-        Compute Percent-Based elimination: e_percent
-        If e_rank != e_percent:
-            Record discrepancy
-            Analyze which method favored whom
-```
-
-### 7.3 杠杆效应量化
-
-定义**粉丝杠杆指数 (Fan Leverage Index, FLI)**：
-$$
-\text{FLI}_M = \frac{\text{Var}(\text{FinalPlacement} | \text{FanRank})}{\text{Var}(\text{FinalPlacement} | \text{JudgeRank})}
-$$
-
-- $\text{FLI}_{\text{Rank}} > \text{FLI}_{\text{Percent}}$ → Rank 机制更偏向粉丝
-- 反之亦然
-
----
-
-## 八、验证与鲁棒性
-
-### 8.1 内部一致性检验
-
-对于已知结果（如最终冠军），检验推断的 $\hat{V}$ 是否与最终排名一致。
-
-### 8.2 争议案例压力测试
-
-| 争议选手 | 季 | 预期模型输出 |
-|----------|---|--------------|
-| Jerry Rice | 2 | HLD 极低（铁粉托底） |
-| Billy Ray Cyrus | 4 | HLD 极低 |
-| Bristol Palin | 11 | HLD 赛季最低 |
-| Bobby Bones | 27 | HLD 极低 + 粉丝杠杆最高 |
-
-### 8.3 敏感性分析
-
-- 变动先验参数 $\sigma^2$ ± 20%
-- 变动约束松弛度（允许近似满足）
-- 对比不同 MCMC 采样链的收敛性
-
----
-
-## 九、论文结构建议
-
-```
-1. Introduction
-   - DWTS as an information-asymmetric voting system
-   - The "hidden liquidity" metaphor from finance
-
-2. Model Development
-   - M1: Constraint-based permutation inference
-   - M2: Bayesian liquidity inference with MCMC
-   - M3: Factor analysis (celebrity attributes)
-   - M4: Mechanism fairness comparison
-
-3. Results
-   - Fan vote estimates with confidence intervals
-   - Controversy case studies (Bristol, Bobby, etc.)
-   - Rank vs Percent mechanism comparison
-   - Celebrity/Pro impact factors (SHAP plots)
-
-4. Sensitivity Analysis
-   - Prior robustness
-   - Constraint relaxation
-   - MCMC convergence diagnostics
-
-5. Recommendations
-   - Which mechanism is "fairer"?
-   - Proposed hybrid mechanism
-   - Memo to DWTS producers
-
-6. Conclusion
+New/lesser-known pros:
+    Expected u_pro ≈ 0
 ```
 
 ---
 
-## 十、三天实施路线图
+## 六、粉丝票量化与不确定性
 
-| 天数 | 任务 | 产出 |
+### 6.1 输出规范
+
+对每个选手 $i$ 每周 $w$：
+
+| 指标 | 定义 | 用途 |
 |------|------|------|
-| **Day 1** | 数据清洗 + M1 约束求解器 | 每周可行粉丝排名集 |
-| **Day 2** | M2 贝叶斯推断 + M3 因子分析 | $\hat{V}$ 点估计 + 置信区间 + SHAP |
-| **Day 3** | M4 机制对比 + 争议案例 + 敏感性 | 完整论文草稿 |
+| `FanRank_median` | $\text{median}(\text{FanRank}^{(t)}_{i,w})$ | 点估计 |
+| `FanRank_CI` | $[Q_{2.5\%}, Q_{97.5\%}]$ | 95% 置信区间 |
+| `HLD` (Hidden Liquidity Depth) | $\mathbb{E}[\text{FanRank}_i]$ | 流动性深度 |
+| `FanShare` | $\hat{V}_{i,w} / \sum_j \hat{V}_{j,w}$ | 粉丝份额（归一化） |
+
+### 6.2 总票数标定
+
+由于真实总票数未知，设：
+$$
+\sum_{i \in \text{Alive}_w} V_{i,w} = T_w \quad (\text{可调超参，默认} T_w = 1)
+$$
+
+若需绝对量级，可参考历史公开数据（如 S1 公开的百万级投票）进行校准。
 
 ---
 
-> **Killer Quote for Abstract**:  
-> *"By reconceptualizing DWTS as a dual-auction market where judges provide 'public quotes' and fans submit 'dark pool orders', we reverse-engineer the hidden voting distribution through survival-based liquidity inference—revealing that Bristol Palin commanded the deepest latent fan liquidity in the show's history, equivalent to a market-maker's undisclosed iceberg order."*
+## 七、评估与校准指标
+
+### 7.1 淘汰预测评估
+
+| 指标 | 公式 | 含义 |
+|------|------|------|
+| **淘汰复原率** | $\frac{1}{W}\sum_w \mathbb{1}[\hat{e}_w = e_w]$ | 预测淘汰者准确率 |
+| **Brier Score** | $\frac{1}{nW}\sum_{i,w}(p_{i,w} - y_{i,w})^2$ | 概率校准度 |
+| **Log-Loss** | $-\frac{1}{nW}\sum_{i,w}[y\log p + (1-y)\log(1-p)]$ | 似然评估 |
+| **区间覆盖率** | $\frac{1}{W}\sum_w \mathbb{1}[e_w \in \text{Top-k-Risk}]$ | 真实淘汰落入高风险集比例 |
+
+### 7.2 置信区间评估
+
+```python
+def evaluate_ci_coverage(samples, true_outcomes):
+    """
+    检验 95% CI 的真实覆盖率
+    理想情况下应接近 95%
+    """
+    covered = 0
+    for week, true_rank in true_outcomes.items():
+        ci_low, ci_high = np.percentile(samples[week], [2.5, 97.5])
+        if ci_low <= true_rank <= ci_high:
+            covered += 1
+    return covered / len(true_outcomes)
+```
+
+---
+
+## 八、公平性与机制对比
+
+### 8.1 反事实重放算法
+
+```python
+def counterfactual_analysis(season_data, posterior_samples):
+    """
+    对每季每周，使用推断的 V 在不同机制下重放淘汰决策
+    """
+    results = []
+    
+    for week_event in season_data:
+        for V_sample in posterior_samples[week_event]:
+            # 计算三种机制下的淘汰者
+            elim_rank = compute_elimination(V_sample, "Rank")
+            elim_percent = compute_elimination(V_sample, "Percent")
+            elim_jp = compute_elimination(V_sample, "Rank+JudgePick")
+            
+            results.append({
+                'week': week_event.week,
+                'actual': week_event.eliminated,
+                'rank_cf': elim_rank,
+                'percent_cf': elim_percent,
+                'jp_cf': elim_jp,
+                'discrepancy': len(set([elim_rank, elim_percent, elim_jp])) > 1
+            })
+    
+    return pd.DataFrame(results)
+```
+
+### 8.2 杠杆/弹性指标
+
+**评委弹性 (Judge Elasticity)**：
+$$
+\eta_J = \frac{\partial \Pr(\text{survive})}{\partial J} \bigg|_{\bar{J}, \bar{V}}
+$$
+
+**粉丝弹性 (Fan Elasticity)**：
+$$
+\eta_V = \frac{\partial \Pr(\text{survive})}{\partial V} \bigg|_{\bar{J}, \bar{V}}
+$$
+
+**机制偏向指数**：
+$$
+\text{Bias}_M = \frac{\eta_V}{\eta_J} \quad
+\begin{cases}
+> 1 & \text{偏粉丝} \\
+< 1 & \text{偏评委} \\
+= 1 & \text{平衡}
+\end{cases}
+$$
+
+### 8.3 争议案例量化表
+
+| Season | Contestant | JudgeRank (周均) | HLD Percentile | 机制分歧 | 反事实结果 |
+|--------|------------|------------------|----------------|----------|------------|
+| 2 | Jerry Rice | 倒数1-2 | P5 | Rank ≠ Percent | Percent下更早淘汰 |
+| 4 | Billy Ray Cyrus | 倒数1-2 | P10 | 有 | - |
+| 11 | Bristol Palin | 倒数 (12次) | **P1** (最强) | 显著 | - |
+| 27 | Bobby Bones | 倒数 | P3 | N/A (Rank+JP) | - |
+
+---
+
+## 九、可视化产出
+
+### 9.1 推荐图表
+
+| 图表类型 | 内容 | 用途 |
+|----------|------|------|
+| **瀑布图** | Combined 分解为 Judge vs Fan 贡献 | 解释每周淘汰原因 |
+| **生存曲线** | 基于 posterior 淘汰概率的 Kaplan-Meier | 选手"寿命"分布 |
+| **误差条图** | FanRank 点估计 + 95% CI | 不确定性展示 |
+| **SHAP Summary** | 特征对 FanRank 的影响 | 因子重要性 |
+| **热力图** | 季×选手 的 HLD 矩阵 | 跨季对比 |
+| **分歧率曲线** | Rank vs Percent 机制分歧随周数变化 | 机制对比 |
+
+### 9.2 可视化代码提示
+
+```python
+# 瀑布图示例
+def plot_combined_waterfall(week_data, fan_rank_estimate):
+    """
+    展示单周各选手的 combined score 分解
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    contestants = week_data.contestants_alive
+    judge_contrib = [compute_judge_contrib(c, week_data) for c in contestants]
+    fan_contrib = [compute_fan_contrib(c, fan_rank_estimate) for c in contestants]
+    
+    x = np.arange(len(contestants))
+    ax.bar(x, judge_contrib, label='Judge Contribution', color='steelblue')
+    ax.bar(x, fan_contrib, bottom=judge_contrib, label='Fan Contribution', color='coral')
+    
+    ax.axhline(y=threshold, linestyle='--', color='red', label='Elimination Threshold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(contestants, rotation=45)
+    ax.legend()
+    
+    return fig
+```
+
+---
+
+## 十、代码接口规范
+
+### 10.1 核心求解器接口
+
+```python
+def solve_week(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    mechanism: str,           # "Rank" | "Percent" | "Rank+JudgePick"
+    bottom2: Optional[Tuple[str, str]] = None,  # for Rank+JudgePick
+    relax: float = 0.0,       # constraint relaxation δ
+    solver: str = "auto"      # "enum" | "cpsat" | "mcmc"
+) -> List[Dict[str, int]]:
+    """
+    Returns: List of feasible fan_rank assignments
+    """
+    n = len(judge_scores)
+    
+    if solver == "auto":
+        solver = "enum" if n <= 6 else ("cpsat" if n <= 12 else "mcmc")
+    
+    if solver == "enum":
+        return solve_week_enum(judge_scores, eliminated, mechanism, relax)
+    elif solver == "cpsat":
+        return solve_week_cpsat(judge_scores, eliminated, mechanism, relax)
+    else:
+        return mcmc_sample_votes(judge_scores, eliminated, mechanism)
+```
+
+### 10.2 采样接口
+
+```python
+def sample_posterior(
+    season_events: List[WeekEvent],
+    prior_params: Dict,
+    T: int = 5000,
+    burn: int = 1000,
+    thin: int = 5
+) -> Dict[int, np.ndarray]:
+    """
+    Returns: {week: (n_samples, n_contestants) array of fan_rank samples}
+    """
+    pass
+```
+
+### 10.3 评估接口
+
+```python
+def evaluate_model(
+    predictions: Dict[int, np.ndarray],
+    ground_truth: Dict[int, str]
+) -> Dict[str, float]:
+    """
+    Returns: {
+        'accuracy': float,
+        'brier_score': float,
+        'log_loss': float,
+        'ci_coverage': float
+    }
+    """
+    pass
+```
+
+---
+
+## 十一、三天实施路线图（更新版）
+
+| 天数 | 上午 | 下午 | 产出 |
+|------|------|------|------|
+| **Day 1** | 数据清洗 + 事件序列构建 | M1 约束求解器 (enum + cpsat) | 每周可行粉丝排名集 |
+| **Day 2** | M2 MCMC 采样器 + 先验标定 | M3 因子分析 (层次模型) | 后验分布 + SHAP |
+| **Day 3** | M4 机制对比 + 争议案例 | 敏感性分析 + 论文撰写 | 完整论文草稿 |
+
+---
+
+## 十二、关键技术决策备忘
+
+| 决策点 | 推荐选项 | 备选方案 | 理由 |
+|--------|----------|----------|------|
+| 约束求解 | CP-SAT | ILP (Gurobi) | 开源 + 足够快 |
+| MCMC 采样 | Metropolis-Hastings | SMC / NUTS | 实现简单 |
+| 先验 | 层次正态 | Dirichlet | 可解释性强 |
+| 敏感性 | δ ∈ {0, 0.1, 0.3, 0.5} | - | 覆盖从严到松 |
+| 评估 | Brier + 复原率 | AUC | 直观 + 可比 |
+
+---
+
+> **Killer Quote for Abstract (v2)**:  
+> *"By reconceptualizing DWTS as a dual-auction market with observable 'public quotes' (judge scores) and latent 'dark pool orders' (fan votes), we employ constraint-satisfaction programming and Bayesian inference to reverse-engineer the hidden voting distribution. Our model reveals Bristol Palin commanded the deepest latent fan liquidity in the show's 34-season history—surviving 12 elimination-worthy judge scores through an 'iceberg order' of loyal voters invisible to all but the survival outcome."*
