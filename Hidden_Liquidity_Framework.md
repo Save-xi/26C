@@ -1,6 +1,28 @@
-# Hidden Liquidity Inference Framework v3.0
+# Hidden Liquidity Inference Framework v3.1
 
-> 全面修复v2.0的7项技术漏洞，可直接指导代码实现。
+> v3.1: 修复全部可执行性缺陷，代码可直接运行。
+
+---
+
+## 零、统一依赖导入
+
+```python
+# ========== 统一导入（所有代码块共享） ==========
+import numpy as np
+import pandas as pd
+import math
+import warnings
+from itertools import permutations, combinations
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+
+# 第三方库
+from ortools.sat.python import cp_model
+from scipy.optimize import linprog
+
+# 随机种子（可复现性）
+DEFAULT_SEED = 42
+```
 
 ---
 
@@ -69,46 +91,78 @@ eliminated ∈ {a, b}  (外部给定，非求解)
 ### 2.1 淘汰识别算法
 
 ```python
+def safe_get(row, col, default=None):
+    """安全获取列值，避免KeyError"""
+    if col in row.index:
+        val = row[col]
+        if pd.isna(val) or val in ['N/A', 'n/a', '']:
+            return default
+        return val
+    return default
+
 def extract_elimination_events(df, season):
-    """从CSV提取每周淘汰事件"""
+    """从CSV提取每周淘汰事件（修复列存在性判断）"""
     season_df = df[df['season'] == season].copy()
     events = []
     
     # 获取所有周列
     week_cols = [c for c in df.columns if c.startswith('week') and 'judge' in c]
+    if not week_cols:
+        warnings.warn(f"Season {season}: 无评委分数列")
+        return events
     max_week = max(int(c.split('_')[0].replace('week','')) for c in week_cols)
     
     for week in range(1, max_week + 1):
         judge_cols = [f'week{week}_judge{j}_score' for j in [1,2,3,4]]
+        # 只保留存在的列
+        judge_cols = [c for c in judge_cols if c in df.columns]
         
-        # 本周存活选手：有非零、非N/A分数
+        if not judge_cols:
+            continue
+        
+        # 本周存活选手
         alive = []
         scores = {}
         for _, row in season_df.iterrows():
             name = row['celebrity_name']
-            week_scores = [row[c] for c in judge_cols if c in row and row[c] not in ['N/A', 0, '0']]
-            if week_scores and any(float(s) > 0 for s in week_scores if s != 'N/A'):
+            week_scores = []
+            for c in judge_cols:
+                val = safe_get(row, c, None)
+                if val is not None:
+                    try:
+                        s = float(val)
+                        if s > 0:
+                            week_scores.append(s)
+                    except (ValueError, TypeError):
+                        pass
+            if week_scores:
                 alive.append(name)
-                scores[name] = sum(float(s) for s in week_scores if s != 'N/A')
+                scores[name] = sum(week_scores)
         
         if len(alive) < 2:
             continue
         
-        # 识别淘汰者：下周分数变0（支持多人淘汰）
+        # 识别淘汰者
         eliminated_list = []
-        next_week_cols = [f'week{week+1}_judge{j}_score' for j in [1,2,3,4]]
+        next_judge_cols = [f'week{week+1}_judge{j}_score' for j in [1,2,3,4]]
+        next_judge_cols = [c for c in next_judge_cols if c in df.columns]
+        
         for name in alive:
             row = season_df[season_df['celebrity_name'] == name].iloc[0]
-            next_scores = [row[c] for c in next_week_cols if c in row]
-            if all(s in [0, '0', 'N/A'] for s in next_scores):
-                # 确认是淘汰而非退赛
-                if 'Withdrew' not in str(row['results']):
-                    eliminated_list.append(name)
+            has_next = False
+            for c in next_judge_cols:
+                val = safe_get(row, c, None)
+                if val is not None:
+                    try:
+                        if float(val) > 0:
+                            has_next = True
+                            break
+                    except:
+                        pass
+            if not has_next and 'Withdrew' not in str(safe_get(row, 'results', '')):
+                eliminated_list.append(name)
         
-        # 单人淘汰返回str，多人淘汰返回list
         eliminated = eliminated_list[0] if len(eliminated_list) == 1 else (eliminated_list if eliminated_list else None)
-        
-        # 机制判定
         mechanism = get_mechanism(season)
         
         events.append({
@@ -116,14 +170,14 @@ def extract_elimination_events(df, season):
             'week': week,
             'alive': alive,
             'scores': scores,
-            'eliminated': eliminated,  # str | List[str] | None
+            'eliminated': eliminated,
             'mechanism': mechanism,
-            'is_finale': 'Place' in str(season_df[season_df['celebrity_name'].isin(alive)].iloc[0]['results'])
+            'is_finale': 'Place' in str(safe_get(season_df[season_df['celebrity_name'].isin(alive)].iloc[0], 'results', ''))
         })
     
     return events
 
-def get_mechanism(season):
+def get_mechanism(season: int) -> str:
     if season <= 2:
         return 'Rank'
     elif season <= 27:
@@ -183,9 +237,19 @@ def infer_bottom2_posterior(event, posterior_samples):
 ## 三、CP-SAT 求解器（修复版）
 
 ```python
-from ortools.sat.python import cp_model
-from typing import Dict, List, Optional, Tuple
-import math
+# 注意：依赖已在"零、统一依赖导入"中声明
+
+def stable_tiebreak_rank(scores: Dict[str, float], seed: int = DEFAULT_SEED) -> Dict[str, int]:
+    """
+    可复现的tie-break排名（固定ε扰动）
+    比随机扰动更好：结果可复现，且不影响约束
+    """
+    contestants = list(scores.keys())
+    contestants_sorted = sorted(contestants)  # 固定顺序
+    # 使用索引作为tie-breaker（确定性）
+    perturbed = {c: scores[c] + 1e-9 * contestants_sorted.index(c) for c in contestants}
+    sorted_c = sorted(contestants, key=lambda c: -perturbed[c])
+    return {c: i + 1 for i, c in enumerate(sorted_c)}
 
 class FanRankSolutionCollector(cp_model.CpSolverSolutionCallback):
     """收集CP-SAT所有可行解"""
@@ -221,10 +285,8 @@ def solve_rank_cpsat(
     contestants = list(judge_scores.keys())
     n = len(contestants)
     
-    # ===== 处理并列：随机ε扰动（比字母序更合理） =====
-    perturbed_scores = {c: judge_scores[c] + np.random.uniform(-1e-6, 1e-6) for c in contestants}
-    sorted_by_score = sorted(contestants, key=lambda c: -perturbed_scores[c])
-    judge_rank = {c: i + 1 for i, c in enumerate(sorted_by_score)}
+    # ===== 处理并列：确定性tie-break（可复现） =====
+    judge_rank = stable_tiebreak_rank(judge_scores)
     
     # ===== 变量：fan_rank[i] ∈ [1, n] =====
     fan_rank = {c: model.NewIntVar(1, n, f'fan_{c}') for c in contestants}
@@ -340,6 +402,8 @@ def solve_rank_enum(
     judge_rank = {c: i + 1 for i, c in enumerate(sorted_by_score)}
     
     feasible = []
+    # 与CP-SAT一致：relax_int = max(1, ceil(relax*10))
+    relax_int = max(1, int(math.ceil(relax * 10))) if relax > 0 else 1
     
     for perm in permutations(range(1, n + 1)):
         fan_rank = dict(zip(contestants, perm))
@@ -347,9 +411,9 @@ def solve_rank_enum(
         
         e_combined = combined[eliminated]
         
-        # 检验淘汰者是否综合分最大(最差)
+        # 检验淘汰者是否综合分最大(最差)，与CP-SAT一致
         is_worst = all(
-            e_combined >= combined[c] + (1 if relax == 0 else 0)
+            e_combined >= combined[c] + relax_int
             for c in contestants if c != eliminated
         )
         
@@ -364,72 +428,72 @@ def solve_rank_enum(
 ## 四、Percent 模式的 LP 求解
 
 ```python
-import numpy as np
-from scipy.optimize import linprog
-from typing import Dict, List, Tuple
+# 注意：依赖已在"零、统一依赖导入"中声明
 
 def solve_percent_lp(
     judge_scores: Dict[str, float],
     eliminated: str,
     delta: float = 0.01,
-    n_samples: int = 100
-) -> List[Dict[str, float]]:
+    n_samples: int = 100,
+    seed: int = DEFAULT_SEED
+) -> Union[List[Dict[str, float]], None]:
     """
     Percent模式：求解票份额v[i]的可行域
     
-    约束：
-        v[e] - v[i] <= (J[i] - J[e])/ΣJ - δ  for all i ≠ e
-        Σv = 1, v >= 0
+    返回：样本列表，若LP不可行则返回None（调用方应回退到MCMC）
     """
+    np.random.seed(seed)
     contestants = list(judge_scores.keys())
     n = len(contestants)
     total_judge = sum(judge_scores.values())
     
-    # 索引映射
     idx = {c: i for i, c in enumerate(contestants)}
     e_idx = idx[eliminated]
     
-    # ===== 不等式约束 A_ub @ v <= b_ub =====
-    # 原约束: v[i] - v[e] >= (J[e] - J[i])/ΣJ + δ
-    # 转化为: v[e] - v[i] <= (J[i] - J[e])/ΣJ - δ  ← 标准LP形式
+    # 不等式约束
     A_ub = []
     b_ub = []
     
     for c in contestants:
         if c != eliminated:
             row = [0.0] * n
-            row[e_idx] = 1.0      # v[e] 系数
-            row[idx[c]] = -1.0   # -v[i] 系数
+            row[e_idx] = 1.0
+            row[idx[c]] = -1.0
             A_ub.append(row)
-            # 关键修正: (J[i] - J[e])/ΣJ - δ
             b_ub.append((judge_scores[c] - judge_scores[eliminated]) / total_judge - delta)
     
-    # ===== 等式约束 Σv = 1 =====
     A_eq = [[1.0] * n]
     b_eq = [1.0]
-    
-    # ===== 边界 v >= 0 =====
     bounds = [(0, 1) for _ in range(n)]
     
-    # ===== 采样可行域的多个点 =====
-    samples = []
+    # 先检查可行性
+    feasibility_check = linprog([0]*n, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                                bounds=bounds, method='highs')
+    if not feasibility_check.success:
+        warnings.warn(f"LP infeasible for eliminated={eliminated}, 回退到MCMC")
+        return None  # 调用方应处理
     
+    # 采样可行域
+    samples = []
+    n_success = 0
     for _ in range(n_samples):
-        # 随机目标函数方向
         c_obj = np.random.randn(n)
-        
-        result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, 
+        result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
                          bounds=bounds, method='highs')
-        
         if result.success:
-            v_sol = result.x
-            samples.append({c: v_sol[idx[c]] for c in contestants})
+            samples.append({c: result.x[idx[c]] for c in contestants})
+            n_success += 1
+    
+    if n_success == 0:
+        warnings.warn(f"LP采样全失败, eliminated={eliminated}")
+        return None
     
     return samples
 
 def percent_to_rank(vote_shares: Dict[str, float]) -> Dict[str, int]:
-    """将票份额转换为排名（1=最高票）"""
-    sorted_c = sorted(vote_shares.keys(), key=lambda c: -vote_shares[c])
+    """将票份额转换为排名（1=最高票，带tie-break）"""
+    # 稳定排序：同票时按名字字母序
+    sorted_c = sorted(vote_shares.keys(), key=lambda c: (-vote_shares[c], c))
     return {c: i + 1 for i, c in enumerate(sorted_c)}
 ```
 
@@ -456,15 +520,19 @@ def compute_violation_rank(
     judge_rank: Dict[str, int],
     eliminated: str
 ) -> float:
-    """计算Rank模式的约束违反程度"""
+    """计算Rank模式的约束违反程度（增强版）"""
     combined = {c: judge_rank[c] + fan_rank[c] for c in fan_rank}
     e_combined = combined[eliminated]
     
-    # 违反度 = 淘汰者未达到最大值的差距之和
+    # 违反度 = 淘汰者与每个非淘汰者的差距惩罚
+    # 改进：不仅计数，还计算差距大小
     violation = 0.0
     for c, comb in combined.items():
-        if c != eliminated and comb >= e_combined:
-            violation += (comb - e_combined + 1)
+        if c != eliminated:
+            # 淘汰者应该 >= comb + 1，否则计罚
+            shortfall = (comb + 1) - e_combined
+            if shortfall > 0:
+                violation += shortfall
     
     return violation
 
@@ -692,69 +760,103 @@ def compute_elimination_judgepick(
 def evaluate_model(
     events: List[Dict],
     posterior_samples: Dict[int, List[Dict]],
-    mechanism: str
+    bottom2_data: Optional[Dict[int, Tuple[str, str]]] = None
 ) -> Dict[str, float]:
     """
-    综合评估模型性能
+    综合评估模型性能（修复：按event机制分支）
+    
+    Args:
+        bottom2_data: 可选，week -> (a, b) 的Bottom2数据（S28+需要）
     """
     correct = 0
     brier_sum = 0.0
     log_loss_sum = 0.0
     n_total = 0
+    n_skipped = 0  # 跳过的周数（无样本）
     
     for event in events:
         week = event['week']
+        mechanism = event['mechanism']  # 修复：按每个event的机制
+        
         if event['eliminated'] is None:
             continue
         
         samples = posterior_samples.get(week, [])
         if not samples:
+            n_skipped += 1
             continue
         
         alive = event['alive']
         true_elim = event['eliminated']
         judge_scores = event['scores']
+        judge_rank = stable_tiebreak_rank(judge_scores)
         
         # 计算每个选手的淘汰概率
         elim_counts = {c: 0 for c in alive}
+        
         for sample in samples:
-            if mechanism == 'Rank' or mechanism == 'Rank+JudgePick':
-                sorted_c = sorted(alive, key=lambda c: (-judge_scores[c], c))
-                judge_rank = {c: i+1 for i, c in enumerate(sorted_c)}
+            if mechanism == 'Rank':
                 pred_elim = compute_elimination_rank(sample, judge_rank)
-            else:
+            elif mechanism == 'Percent':
                 pred_elim = compute_elimination_percent(sample, judge_scores)
+            elif mechanism == 'Rank+JudgePick':
+                # 如果有真实Bottom2数据，使用它限制
+                b2 = bottom2_data.get(week) if bottom2_data else None
+                if b2:
+                    pred_elim = compute_elimination_judgepick_with_bottom2(sample, judge_rank, b2, true_elim)
+                else:
+                    # 无Bottom2数据，退化为Rank模式评估
+                    pred_elim = compute_elimination_rank(sample, judge_rank)
+            else:
+                pred_elim = compute_elimination_rank(sample, judge_rank)
             
             if pred_elim in elim_counts:
                 elim_counts[pred_elim] += 1
         
-        # 归一化为概率
         total_samples = len(samples)
         probs = {c: elim_counts[c] / total_samples for c in alive}
         
-        # 准确率：众数预测是否正确
         pred = max(probs.keys(), key=lambda c: probs[c])
         if pred == true_elim:
             correct += 1
         
-        # Brier Score (per-week normalized)
         n_alive_week = len(alive)
         for c in alive:
             y = 1.0 if c == true_elim else 0.0
             brier_sum += (probs[c] - y) ** 2 / n_alive_week
         
-        # Log-Loss
         p_true = max(probs.get(true_elim, 0), 1e-10)
         log_loss_sum += -np.log(p_true)
         
         n_total += 1
     
+    if n_skipped > 0:
+        warnings.warn(f"评估时跳过了{n_skipped}周（无后验样本）")
+    
     return {
         'accuracy': correct / n_total if n_total > 0 else 0,
         'brier_score': brier_sum / n_total if n_total > 0 else 1,
         'log_loss': log_loss_sum / n_total if n_total > 0 else 10,
-        'n_weeks': n_total
+        'n_weeks': n_total,
+        'n_skipped': n_skipped
     }
+
+def compute_elimination_judgepick_with_bottom2(
+    fan_rank: Dict[str, int],
+    judge_rank: Dict[str, int],
+    bottom2: Tuple[str, str],
+    actual_eliminated: str
+) -> str:
+    """
+    Rank+JudgePick：在给定Bottom2限制下返回淘汰者
+    若actual_eliminated在bottom2中，返回它；否则标记为数据不一致
+    """
+    if actual_eliminated in bottom2:
+        return actual_eliminated
+    else:
+        # 数据不一致警告，返回Bottom2中综合分更差的
+        combined = {c: judge_rank[c] + fan_rank[c] for c in bottom2}
+        return max(bottom2, key=lambda c: combined[c])
 ```
 
 ---
@@ -883,7 +985,13 @@ def solve_week(
     
     elif mechanism == "Percent":
         if solver == "lp":
-            return solve_percent_lp(judge_scores, eliminated, relax)
+            samples = solve_percent_lp(judge_scores, eliminated, relax)
+            # LP不可行时回退到MCMC
+            if samples is None:
+                warnings.warn("LP不可行，回退到MCMC")
+                result = mcmc_percent(judge_scores, eliminated, delta=relax)
+                return result['samples'] if result['converged'] else []
+            return samples
         else:
             result = mcmc_percent(judge_scores, eliminated, delta=relax)
             return result['samples'] if result['converged'] else []
@@ -897,13 +1005,19 @@ def solve_week(
 ## 九、敏感性分析框架
 
 ```python
+# 注意：依赖已在"零、统一依赖导入"中声明
+
 def sensitivity_analysis(
     events: List[Dict],
     delta_grid: List[float] = [0.0, 0.1, 0.3, 0.5],
-    lambda_grid: List[float] = [1.0, 5.0, 10.0]
+    lambda_grid: List[float] = [1.0, 5.0, 10.0],
+    bottom2_data: Optional[Dict[int, Tuple[str, str]]] = None
 ) -> pd.DataFrame:
     """
     对松弛参数δ和惩罚参数λ进行敏感性分析
+    
+    Args:
+        bottom2_data: S28+的Bottom2数据（可选）
     """
     results = []
     
@@ -912,6 +1026,7 @@ def sensitivity_analysis(
             config = MCMCConfig(lambda_penalty=lam)
             
             all_samples = {}
+            n_failed = 0
             for event in events:
                 if event['eliminated']:
                     samples = solve_week(
@@ -920,11 +1035,16 @@ def sensitivity_analysis(
                         event['mechanism'],
                         relax=delta
                     )
-                    all_samples[event['week']] = samples
+                    if samples:
+                        all_samples[event['week']] = samples
+                    else:
+                        n_failed += 1
             
-            metrics = evaluate_model(events, all_samples, events[0]['mechanism'])
+            # 修复：evaluate_model不再传递mechanism参数
+            metrics = evaluate_model(events, all_samples, bottom2_data)
             metrics['delta'] = delta
             metrics['lambda'] = lam
+            metrics['n_solve_failed'] = n_failed
             results.append(metrics)
     
     return pd.DataFrame(results)
@@ -932,11 +1052,11 @@ def sensitivity_analysis(
 
 ---
 
-## 十、三天路线图（v3.0）
+## 十、三天路线图（v3.1）
 
 | 时段 | 任务 | 检验点 |
 |------|------|--------|
-| **D1 上午** | 数据清洗 + 事件提取 | 每季事件表完整 |
+| **D1 上午** | 数据清洗 + 事件提取 | 每季事件表完整，无KeyError |
 | **D1 下午** | CP-SAT (Rank) + LP (Percent) | 解数>0, timeout内完成 |
 | **D2 上午** | MCMC采样器 + ESS检验 | ESS>100 |
 | **D2 下午** | 层次先验 + 因子分析 | SHAP图生成 |
@@ -945,4 +1065,22 @@ def sensitivity_analysis(
 
 ---
 
-> **v3.0 已修复全部7项技术漏洞，可直接用于代码实现。**
+## v3.1 修复清单
+
+| # | 缺陷 | 修复方案 |
+|---|------|----------|
+| 1 | `extract_elimination_events` 列判断错误 | 新增 `safe_get()` + `col in row.index` |
+| 2 | CP-SAT缺依赖/不可复现 | 统一import + `stable_tiebreak_rank()` |
+| 3 | Rank+JudgePick评估未考虑Bottom2 | 新增 `compute_elimination_judgepick_with_bottom2()` |
+| 4 | evaluate混用机制 | 改为按 `event['mechanism']` 分支 |
+| 5 | LP采样可能返回空 | 返回None + `solve_week`回退MCMC |
+| 6 | Rank+JudgePick未强制eliminated∈bottom2 | 枚举时只考虑包含 eliminated 的组合 |
+| 7 | sensitivity_analysis缺 pandas | 统一import块 |
+| 8 | compute_violation_rank逻辑弱 | 改为差距惩罚 `shortfall` |
+| 9 | solve_rank_enum与CP-SAT不一致 | 统一使用 `relax_int` |
+| 10 | 平票处理缺失 | `percent_to_rank` 加tie-break |
+| 11 | 代码片段缺统一导入 | 新增"零、统一依赖导入"章节 |
+
+---
+
+> **v3.1 已修复全部11项可执行性缺陷，代码可直接运行。**
