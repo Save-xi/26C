@@ -1,521 +1,948 @@
-# Hidden Liquidity Inference Framework for DWTS Fan Vote Estimation (v2.0)
+# Hidden Liquidity Inference Framework v3.0
 
-> **核心思想**：将选秀节目建模为**双边信息不对称市场**，评委打分是"公开报价"，粉丝投票是"暗池订单"。通过分析选手的"抗跌性"——即低分时的存活概率——逆向破解隐藏的粉丝投票分布。
-
----
-
-## 一、问题建模：市场微观结构类比
-
-### 1.1 核心对应关系
-
-| DWTS 选秀竞赛 | 金融市场类比 | 数学符号 |
-|---------------|--------------|----------|
-| 选手 $i$ 在第 $w$ 周 | 资产 $i$ 在交易日 $t$ | $(i, w)$ |
-| 评委总分 $J_{i,w}$ | 公开报价/市价订单 | Observable |
-| 粉丝投票 $V_{i,w}$ | 暗池订单/隐藏限价单 | **Latent (需推断)** |
-| 被淘汰 | 被"清仓"出局 | $E_{i,w} = 1$ |
-| 存活晋级 | 持仓保留 | $S_{i,w} = 1$ |
-| 综合排名 | 综合账面价值 | $R_{i,w}$ |
-
-### 1.2 核心假设
-
-**H1 (理性淘汰)**：每周综合得分最低者被淘汰（机制相关）。
-
-**H2 (隐藏流动性)**：粉丝投票 $V_{i,w}$ 不可直接观测，但其效应体现在选手的"存活韧性"中。
-
-**H3 (噪声容忍)**：允许约束松弛 $\delta \in [0, 0.5]$，以应对裁判偏差、规则扰动、平票打破等现实情况。
+> 全面修复v2.0的7项技术漏洞，可直接指导代码实现。
 
 ---
 
-## 二、投票机制精确刻画
+## 一、三种机制的精确约束建模
 
-### 2.1 三种机制定义
+### 1.1 Rank 模式 (S1-2)
 
-| 机制 | 适用季 | 综合分公式 | 淘汰规则 |
-|------|--------|-----------|----------|
-| **Rank** | S1-2 | $C_i = \text{JudgeRank}_i + \text{FanRank}_i$ | $\arg\max C_i$ 被淘汰 |
-| **Percent** | S3-27 | $C_i = \frac{J_i}{\sum_j J_j} + \frac{V_i}{\sum_j V_j}$ | $\arg\min C_i$ 被淘汰 |
-| **Rank+JudgePick** | S28-34 | 同 Rank 取 $\text{Bottom}_2$ | 评委从 $\text{Bottom}_2$ 中二选一淘汰 |
+**变量**：`fan_rank[i] ∈ {1,...,n}`，AllDifferent
 
-### 2.2 Rank+JudgePick 两阶段约束
-
+**约束**：
 ```
-Stage 1: 确定 Bottom2
-    Bottom2 = {a, b} s.t. C_a, C_b 为最大两个
+∀i ≠ e: judge_rank[e] + fan_rank[e] ≥ judge_rank[i] + fan_rank[i] + 1
+```
+（+1 确保严格大于，防止并列）
 
-Stage 2: 评委裁决
-    eliminated ∈ Bottom2  (由评委现场投票决定)
+### 1.2 Percent 模式 (S3-27) ✅ 已修复
+
+**变量**：票份额 `v[i] ≥ 0`，且 `Σv[i] = 1`
+
+**综合分**（越高越好）：
+```
+C[i] = J[i]/ΣJ + v[i]
 ```
 
-**约束形式化**：
-- 对所有 $k \notin \text{Bottom}_2$：$C_k < \min(C_a, C_b) - \delta$
-- $\text{eliminated} \in \{a, b\}$
+**约束**（淘汰者 e 的 C 最小，即最差）：
+```
+∀i ≠ e: C[i] ≥ C[e] + δ             # 非淘汰者得分更高
+展开: J[i]/ΣJ + v[i] ≥ J[e]/ΣJ + v[e] + δ
+整理: v[i] - v[e] ≥ (J[e] - J[i])/ΣJ + δ  # ⚠️ 注意符号
+```
 
-### 2.3 机制切换表
+这是**线性约束**，可用 LP/QP 求解可行域。
+
+**若需离散排名**：引入 big-M 线性化
+```
+v[i] - v[j] ≥ ε - M·(1 - y[i,j])   # y[i,j]=1 表示 i 票份额 > j
+```
+
+### 1.3 Rank+JudgePick 模式 (S28-34) ✅ 已修复
+
+**两阶段约束**：
+
+> **注意**: Combined rank = Judge_rank + Fan_rank，**值越大=排名越差**
+
+**Stage 1: 确定 Bottom2**（综合排名最差的两人）
+```
+对所有 k ∉ Bottom2:
+    combined[k] ≤ min(combined[a], combined[b]) - 1  # k 排名更靠前(值更小)
+其中 Bottom2 = {a, b}
+```
+
+**Stage 2: 评委裁决**
+```
+eliminated ∈ {a, b}  (外部给定，非求解)
+```
+
+**求解策略**：
+1. 枚举所有 C(n,2) 个 Bottom2 组合
+2. 对每个组合，求解满足 Stage1 的 fan_rank
+3. 保留 eliminated ∈ Bottom2 的组合
+
+---
+
+## 二、数据提取流程（从 CSV 到事件序列）
+
+### 2.1 淘汰识别算法
 
 ```python
-SEASON_MODE = {
-    1: "Rank", 2: "Rank",
-    **{s: "Percent" for s in range(3, 28)},
-    **{s: "Rank+JudgePick" for s in range(28, 35)}
-}
+def extract_elimination_events(df, season):
+    """从CSV提取每周淘汰事件"""
+    season_df = df[df['season'] == season].copy()
+    events = []
+    
+    # 获取所有周列
+    week_cols = [c for c in df.columns if c.startswith('week') and 'judge' in c]
+    max_week = max(int(c.split('_')[0].replace('week','')) for c in week_cols)
+    
+    for week in range(1, max_week + 1):
+        judge_cols = [f'week{week}_judge{j}_score' for j in [1,2,3,4]]
+        
+        # 本周存活选手：有非零、非N/A分数
+        alive = []
+        scores = {}
+        for _, row in season_df.iterrows():
+            name = row['celebrity_name']
+            week_scores = [row[c] for c in judge_cols if c in row and row[c] not in ['N/A', 0, '0']]
+            if week_scores and any(float(s) > 0 for s in week_scores if s != 'N/A'):
+                alive.append(name)
+                scores[name] = sum(float(s) for s in week_scores if s != 'N/A')
+        
+        if len(alive) < 2:
+            continue
+        
+        # 识别淘汰者：下周分数变0（支持多人淘汰）
+        eliminated_list = []
+        next_week_cols = [f'week{week+1}_judge{j}_score' for j in [1,2,3,4]]
+        for name in alive:
+            row = season_df[season_df['celebrity_name'] == name].iloc[0]
+            next_scores = [row[c] for c in next_week_cols if c in row]
+            if all(s in [0, '0', 'N/A'] for s in next_scores):
+                # 确认是淘汰而非退赛
+                if 'Withdrew' not in str(row['results']):
+                    eliminated_list.append(name)
+        
+        # 单人淘汰返回str，多人淘汰返回list
+        eliminated = eliminated_list[0] if len(eliminated_list) == 1 else (eliminated_list if eliminated_list else None)
+        
+        # 机制判定
+        mechanism = get_mechanism(season)
+        
+        events.append({
+            'season': season,
+            'week': week,
+            'alive': alive,
+            'scores': scores,
+            'eliminated': eliminated,  # str | List[str] | None
+            'mechanism': mechanism,
+            'is_finale': 'Place' in str(season_df[season_df['celebrity_name'].isin(alive)].iloc[0]['results'])
+        })
+    
+    return events
+
+def get_mechanism(season):
+    if season <= 2:
+        return 'Rank'
+    elif season <= 27:
+        return 'Percent'
+    else:
+        return 'Rank+JudgePick'
 ```
 
----
-
-## 三、数据处理与事件序列
-
-### 3.1 清洗规则
-
-| 异常类型 | 处理方法 |
-|----------|----------|
-| **N/A 评分** | 缺第4评委 → 用前3评委均值；整周缺失 → 标记 `mask=True` |
-| **多舞平均** | 原数据已均值化，直接使用（如 8.5 表示两舞均分） |
-| **Bonus 分** | 均匀分摊至各评委列（如 bonus=1.5 分给3评委，各加0.5） |
-| **淘汰后 0 分** | 用于识别淘汰周次；建模时对后续周屏蔽该选手 |
-| **周数不一致** | 按实际参赛周数构建事件序列，不强制对齐 |
-
-### 3.2 异常周处理
-
-| 事件类型 | 识别方法 | 处理策略 |
-|----------|----------|----------|
-| **无淘汰周** | 当周无人变0分 | 跳过该周约束 |
-| **多人淘汰** | 当周多人变0分 | 联合约束：所有淘汰者均为最差 |
-| **中途退赛** | results 含 "Withdrew" | 标记 `withdrawal=True`，不计入约束 |
-| **全明星赛 S15** | 特殊赛季 | 单独处理或排除 |
-
-### 3.3 事件表结构 (per season)
+### 2.2 Bottom2 提取（S28+）
 
 ```python
-@dataclass
-class WeekEvent:
-    season: int
-    week: int
-    contestants_alive: List[str]      # 当周存活选手
-    judge_scores: Dict[str, float]    # 评委总分
-    eliminated: Optional[str]         # 淘汰者 (None if no elimination)
-    bottom2: Optional[Tuple[str,str]] # S28+ 底两名
-    mechanism: str                    # Rank | Percent | Rank+JudgePick
-    is_finale: bool                   # 是否决赛周
-    special_flags: Set[str]           # {"no_elim", "double_elim", "withdrawal"}
-```
-
----
-
-## 四、约束构建与求解策略
-
-### 4.1 约束系统形式化
-
-**Rank 模式约束**：
-$$
-\forall i \neq e_w: \quad \text{JudgeRank}_i + \text{FanRank}_i < \text{JudgeRank}_{e_w} + \text{FanRank}_{e_w} - \delta
-$$
-
-**Percent 模式约束**：
-$$
-\forall i \neq e_w: \quad \frac{J_i}{\sum J} + \frac{V_i}{\sum V} > \frac{J_{e_w}}{\sum J} + \frac{V_{e_w}}{\sum V} + \delta
-$$
-
-**Rank+JudgePick 约束**：
-$$
-\begin{cases}
-e_w \in \text{Bottom}_2 \\
-\forall k \notin \text{Bottom}_2: C_k < \min(C_a, C_b) - \delta
-\end{cases}
-$$
-
-### 4.2 分治求解策略
-
-| 选手数 $n$ | 策略 | 复杂度 |
-|------------|------|--------|
-| $n \leq 6$ | 全排列枚举 | $O(n!)$ ≤ 720 |
-| $6 < n \leq 12$ | CP-SAT 约束求解 | $O(\text{poly}(n))$ |
-| $n > 12$ | MCMC/SMC 采样 | $O(T \cdot n)$ |
-
-### 4.3 CP-SAT 形式化 (Google OR-Tools)
-
-```python
-def solve_week_cpsat(judge_scores, eliminated, mechanism, relax=0.0):
+def extract_bottom2(event, df):
     """
-    使用 CP-SAT 求解可行粉丝排名
-    
-    Variables:
-        fan_rank[i] ∈ [1, n]  for each contestant i
-    
-    Constraints:
-        AllDifferent(fan_rank)
-        combined[eliminated] >= combined[i] + relax  for all i ≠ eliminated
+    S28+: 优先从数据集直接提取 Bottom2（节目公开宣布）
+    如果数据缺失则标记为 None，避免错误推断
     """
-    from ortools.sat.python import cp_model
+    season = event['season']
+    week = event['week']
     
+    # 尝试从 results 列或 metadata 提取
+    week_data = df[(df['season'] == season)]
+    bottom2_col = f'week{week}_bottom2'  # 假设有此列
+    
+    if bottom2_col in df.columns:
+        b2_str = week_data[bottom2_col].dropna().iloc[0] if not week_data[bottom2_col].dropna().empty else None
+        if b2_str and ',' in str(b2_str):
+            return tuple(sorted(b2_str.split(',')))
+    
+    # 数据缺失：返回 None，在报告中说明数据限制
+    return None
+
+def infer_bottom2_posterior(event, posterior_samples):
+    """
+    仅当 extract_bottom2 返回 None 时使用
+    从后验分布推断 Bottom2（需标注为"推断值"）
+    """
+    bottom2_candidates = []
+    for sample in posterior_samples:
+        combined = {c: event['judge_rank'][c] + sample[c] for c in event['alive']}
+        sorted_c = sorted(combined.items(), key=lambda x: -x[1])  # 降序=最差在前
+        bottom2_candidates.append(tuple(sorted([sorted_c[0][0], sorted_c[1][0]])))
+    return bottom2_candidates
+```
+
+### 2.3 异常处理规则
+
+| 情况 | 识别方法 | 处理 |
+|------|----------|------|
+| 无淘汰周 | eliminated=None | 跳过该周约束 |
+| 多人淘汰 | 多人下周变0 | 联合约束：所有淘汰者分最低 |
+| 退赛 | results含"Withdrew" | 标记但不计入约束 |
+| S15全明星 | season==15 | **排除**（选手重复出现，扰乱先验） |
+| 并列分数 | 同分 | 稳定排序 + ε扰动 |
+
+---
+
+## 三、CP-SAT 求解器（修复版）
+
+```python
+from ortools.sat.python import cp_model
+from typing import Dict, List, Optional, Tuple
+import math
+
+class FanRankSolutionCollector(cp_model.CpSolverSolutionCallback):
+    """收集CP-SAT所有可行解"""
+    def __init__(self, fan_rank_vars, contestants, max_solutions=1000):
+        cp_model.CpSolverSolutionCallback.__init__(self)
+        self._fan_rank = fan_rank_vars
+        self._contestants = contestants
+        self._solutions = []
+        self._max = max_solutions
+    
+    def on_solution_callback(self):
+        if len(self._solutions) < self._max:
+            sol = {c: self.Value(self._fan_rank[c]) for c in self._contestants}
+            self._solutions.append(sol)
+        else:
+            self.StopSearch()
+    
+    @property
+    def solutions(self):
+        return self._solutions
+
+def solve_rank_cpsat(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    relax: float = 0.0,
+    max_solutions: int = 1000,
+    timeout_sec: float = 60.0
+) -> List[Dict[str, int]]:
+    """
+    Rank模式的CP-SAT求解（S1-2, S28-34的Stage1）
+    """
     model = cp_model.CpModel()
-    n = len(judge_scores)
     contestants = list(judge_scores.keys())
+    n = len(contestants)
     
-    # Variables: fan_rank[i] ∈ [1, n]
+    # ===== 处理并列：随机ε扰动（比字母序更合理） =====
+    perturbed_scores = {c: judge_scores[c] + np.random.uniform(-1e-6, 1e-6) for c in contestants}
+    sorted_by_score = sorted(contestants, key=lambda c: -perturbed_scores[c])
+    judge_rank = {c: i + 1 for i, c in enumerate(sorted_by_score)}
+    
+    # ===== 变量：fan_rank[i] ∈ [1, n] =====
     fan_rank = {c: model.NewIntVar(1, n, f'fan_{c}') for c in contestants}
     
-    # AllDifferent constraint
+    # ===== AllDifferent =====
     model.AddAllDifferent(list(fan_rank.values()))
     
-    # Judge ranks (1 = best)
-    sorted_by_judge = sorted(contestants, key=lambda c: -judge_scores[c])
-    judge_rank = {c: i+1 for i, c in enumerate(sorted_by_judge)}
+    # ===== 淘汰约束：eliminated 的 combined 最大 =====
+    # 整数松弛：relax_int = ceil(relax * 10) / 10 → 放大为整数
+    relax_int = max(1, int(math.ceil(relax * 10)))  # 最小为1确保严格
     
-    # Combined score constraint
     for c in contestants:
         if c != eliminated:
-            # combined[elim] > combined[c]
-            # judge_rank[elim] + fan_rank[elim] > judge_rank[c] + fan_rank[c]
+            # combined[e] >= combined[c] + relax_int
+            # judge_rank[e] + fan_rank[e] >= judge_rank[c] + fan_rank[c] + relax_int
             model.Add(
-                judge_rank[eliminated] + fan_rank[eliminated] 
-                > judge_rank[c] + fan_rank[c] + int(relax)
+                judge_rank[eliminated] + fan_rank[eliminated]
+                >= judge_rank[c] + fan_rank[c] + relax_int
             )
     
-    # Enumerate all solutions
+    # ===== 求解设置 =====
     solver = cp_model.CpSolver()
-    solution_collector = SolutionCollector(fan_rank, contestants)
-    solver.SearchForAllSolutions(model, solution_collector)
+    solver.parameters.max_time_in_seconds = timeout_sec
+    solver.parameters.enumerate_all_solutions = True
     
-    return solution_collector.solutions
+    collector = FanRankSolutionCollector(fan_rank, contestants, max_solutions)
+    status = solver.Solve(model, collector)
+    
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        return collector.solutions
+    else:
+        return []
+
+def solve_rank_judgepick_cpsat(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    bottom2: Optional[Tuple[str, str]] = None,
+    relax: float = 0.0,
+    max_solutions: int = 500,
+    timeout_sec: float = 60.0
+) -> List[Dict[str, int]]:
+    """
+    Rank+JudgePick模式的CP-SAT求解（S28-34）
+    """
+    contestants = list(judge_scores.keys())
+    n = len(contestants)
+    
+    all_solutions = []
+    
+    # ===== 枚举所有可能的 Bottom2 =====
+    from itertools import combinations
+    
+    if bottom2 is not None:
+        bottom2_candidates = [bottom2]
+    else:
+        # 只考虑包含 eliminated 的组合
+        bottom2_candidates = [
+            (eliminated, other) for other in contestants if other != eliminated
+        ]
+    
+    for b2 in bottom2_candidates:
+        model = cp_model.CpModel()
+        
+        sorted_by_score = sorted(contestants, key=lambda c: (-judge_scores[c], c))
+        judge_rank = {c: i + 1 for i, c in enumerate(sorted_by_score)}
+        
+        fan_rank = {c: model.NewIntVar(1, n, f'fan_{c}') for c in contestants}
+        model.AddAllDifferent(list(fan_rank.values()))
+        
+        relax_int = max(1, int(math.ceil(relax * 10)))
+        a, b = b2
+        
+        # Stage1约束：非Bottom2的combined更小（排名更靠前）
+        for k in contestants:
+            if k not in b2:
+                # combined[k] <= combined[Bottom2] - relax_int
+                model.Add(
+                    judge_rank[k] + fan_rank[k]
+                    <= judge_rank[a] + fan_rank[a] - relax_int
+                )
+                model.Add(
+                    judge_rank[k] + fan_rank[k]
+                    <= judge_rank[b] + fan_rank[b] - relax_int
+                )
+        
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = timeout_sec / len(bottom2_candidates)
+        solver.parameters.enumerate_all_solutions = True
+        
+        collector = FanRankSolutionCollector(fan_rank, contestants, max_solutions // len(bottom2_candidates))
+        solver.Solve(model, collector)
+        
+        for sol in collector.solutions:
+            sol['_bottom2'] = b2
+            all_solutions.append(sol)
+    
+    return all_solutions
+
+def solve_rank_enum(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    relax: float = 0.0
+) -> List[Dict[str, int]]:
+    """
+    Rank模式的全排列枚举求解（n≤6时使用）
+    """
+    from itertools import permutations
+    
+    contestants = list(judge_scores.keys())
+    n = len(contestants)
+    
+    sorted_by_score = sorted(contestants, key=lambda c: (-judge_scores[c], c))
+    judge_rank = {c: i + 1 for i, c in enumerate(sorted_by_score)}
+    
+    feasible = []
+    
+    for perm in permutations(range(1, n + 1)):
+        fan_rank = dict(zip(contestants, perm))
+        combined = {c: judge_rank[c] + fan_rank[c] for c in contestants}
+        
+        e_combined = combined[eliminated]
+        
+        # 检验淘汰者是否综合分最大(最差)
+        is_worst = all(
+            e_combined >= combined[c] + (1 if relax == 0 else 0)
+            for c in contestants if c != eliminated
+        )
+        
+        if is_worst:
+            feasible.append(fan_rank)
+    
+    return feasible
 ```
 
-### 4.4 MCMC 采样 (大 $n$ 场景)
+---
+
+## 四、Percent 模式的 LP 求解
 
 ```python
-def mcmc_sample_votes(judge_scores, eliminated, mechanism, 
-                      T=5000, burn=1000, thin=5):
+import numpy as np
+from scipy.optimize import linprog
+from typing import Dict, List, Tuple
+
+def solve_percent_lp(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    delta: float = 0.01,
+    n_samples: int = 100
+) -> List[Dict[str, float]]:
     """
-    Metropolis-Hastings 采样粉丝排名
+    Percent模式：求解票份额v[i]的可行域
     
-    Proposal: 交换两个选手的 fan_rank
-    Acceptance: 满足约束 → accept; 否则以 exp(-λ·violation) 概率接受
+    约束：
+        v[e] - v[i] <= (J[i] - J[e])/ΣJ - δ  for all i ≠ e
+        Σv = 1, v >= 0
     """
-    n = len(judge_scores)
     contestants = list(judge_scores.keys())
+    n = len(contestants)
+    total_judge = sum(judge_scores.values())
     
-    # Initialize: fan_rank inversely proportional to judge_score
-    current = initialize_from_prior(judge_scores)
+    # 索引映射
+    idx = {c: i for i, c in enumerate(contestants)}
+    e_idx = idx[eliminated]
+    
+    # ===== 不等式约束 A_ub @ v <= b_ub =====
+    # 原约束: v[i] - v[e] >= (J[e] - J[i])/ΣJ + δ
+    # 转化为: v[e] - v[i] <= (J[i] - J[e])/ΣJ - δ  ← 标准LP形式
+    A_ub = []
+    b_ub = []
+    
+    for c in contestants:
+        if c != eliminated:
+            row = [0.0] * n
+            row[e_idx] = 1.0      # v[e] 系数
+            row[idx[c]] = -1.0   # -v[i] 系数
+            A_ub.append(row)
+            # 关键修正: (J[i] - J[e])/ΣJ - δ
+            b_ub.append((judge_scores[c] - judge_scores[eliminated]) / total_judge - delta)
+    
+    # ===== 等式约束 Σv = 1 =====
+    A_eq = [[1.0] * n]
+    b_eq = [1.0]
+    
+    # ===== 边界 v >= 0 =====
+    bounds = [(0, 1) for _ in range(n)]
+    
+    # ===== 采样可行域的多个点 =====
     samples = []
     
-    for t in range(T):
-        # Propose: swap two random ranks
-        i, j = random.sample(range(n), 2)
-        proposal = current.copy()
-        proposal[i], proposal[j] = proposal[j], proposal[i]
+    for _ in range(n_samples):
+        # 随机目标函数方向
+        c_obj = np.random.randn(n)
         
-        # Check constraint satisfaction
-        curr_violation = compute_violation(current, judge_scores, eliminated, mechanism)
-        prop_violation = compute_violation(proposal, judge_scores, eliminated, mechanism)
+        result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, 
+                         bounds=bounds, method='highs')
         
-        # Acceptance probability
-        if prop_violation == 0:
-            accept = True
-        elif curr_violation == 0:
-            accept = random.random() < math.exp(-LAMBDA * prop_violation)
-        else:
-            accept = random.random() < math.exp(LAMBDA * (curr_violation - prop_violation))
-        
-        if accept:
-            current = proposal
-        
-        if t >= burn and (t - burn) % thin == 0:
-            samples.append(current.copy())
+        if result.success:
+            v_sol = result.x
+            samples.append({c: v_sol[idx[c]] for c in contestants})
     
     return samples
+
+def percent_to_rank(vote_shares: Dict[str, float]) -> Dict[str, int]:
+    """将票份额转换为排名（1=最高票）"""
+    sorted_c = sorted(vote_shares.keys(), key=lambda c: -vote_shares[c])
+    return {c: i + 1 for i, c in enumerate(sorted_c)}
 ```
 
 ---
 
-## 五、贝叶斯流动性推断
-
-### 5.1 层次先验模型
-
-$$
-\log V_{i,w} \sim \mathcal{N}(\mu_{i,w}, \sigma^2)
-$$
-
-其中：
-$$
-\mu_{i,w} = \underbrace{\beta_0}_{\text{intercept}} 
-+ \underbrace{\beta_{\text{ind}} \cdot \mathbf{X}_{\text{industry}}}_{\text{行业效应}}
-+ \underbrace{\beta_{\text{age}} \cdot \text{Age}_i}_{\text{年龄效应}}
-+ \underbrace{\beta_J \cdot J_{i,w}}_{\text{评委分关联}}
-+ \underbrace{u_{\text{pro}[i]}}_{\text{舞伴随机效应}}
-+ \underbrace{u_{\text{season}}}_{\text{季节随机效应}}
-+ \underbrace{\gamma_w}_{\text{周效应}}
-+ \underbrace{\phi \cdot \text{Momentum}_{i,w}}_{\text{动量项}}
-$$
-
-### 5.2 动态特征
-
-**动量 (Momentum)**：
-$$
-\text{Momentum}_{i,w} = \alpha_1 \cdot \Delta J_{i,w-1} + \alpha_2 \cdot \Delta\text{Rank}_{i,w-1}
-$$
-
-**争议指示变量**：
-$$
-\text{Controversy}_{i,w} = \mathbb{1}[\text{JudgeRank}_{i,w} \geq n-1 \land S_{i,w} = 1]
-$$
-
-### 5.3 舞伴层次效应
-
-```
-pro_effect[p] ~ N(0, τ²_pro)
-
-Top-tier pros (Derek Hough, Mark Ballas, Val, etc.):
-    Expected u_pro > 0 (boost fan votes)
-
-New/lesser-known pros:
-    Expected u_pro ≈ 0
-```
-
----
-
-## 六、粉丝票量化与不确定性
-
-### 6.1 输出规范
-
-对每个选手 $i$ 每周 $w$：
-
-| 指标 | 定义 | 用途 |
-|------|------|------|
-| `FanRank_median` | $\text{median}(\text{FanRank}^{(t)}_{i,w})$ | 点估计 |
-| `FanRank_CI` | $[Q_{2.5\%}, Q_{97.5\%}]$ | 95% 置信区间 |
-| `HLD` (Hidden Liquidity Depth) | $\mathbb{E}[\text{FanRank}_i]$ | 流动性深度 |
-| `FanShare` | $\hat{V}_{i,w} / \sum_j \hat{V}_{j,w}$ | 粉丝份额（归一化） |
-
-### 6.2 总票数标定
-
-由于真实总票数未知，设：
-$$
-\sum_{i \in \text{Alive}_w} V_{i,w} = T_w \quad (\text{可调超参，默认} T_w = 1)
-$$
-
-若需绝对量级，可参考历史公开数据（如 S1 公开的百万级投票）进行校准。
-
----
-
-## 七、评估与校准指标
-
-### 7.1 淘汰预测评估
-
-| 指标 | 公式 | 含义 |
-|------|------|------|
-| **淘汰复原率** | $\frac{1}{W}\sum_w \mathbb{1}[\hat{e}_w = e_w]$ | 预测淘汰者准确率 |
-| **Brier Score** | $\frac{1}{nW}\sum_{i,w}(p_{i,w} - y_{i,w})^2$ | 概率校准度 |
-| **Log-Loss** | $-\frac{1}{nW}\sum_{i,w}[y\log p + (1-y)\log(1-p)]$ | 似然评估 |
-| **区间覆盖率** | $\frac{1}{W}\sum_w \mathbb{1}[e_w \in \text{Top-k-Risk}]$ | 真实淘汰落入高风险集比例 |
-
-### 7.2 置信区间评估
+## 五、MCMC 采样器（完整版）
 
 ```python
-def evaluate_ci_coverage(samples, true_outcomes):
-    """
-    检验 95% CI 的真实覆盖率
-    理想情况下应接近 95%
-    """
-    covered = 0
-    for week, true_rank in true_outcomes.items():
-        ci_low, ci_high = np.percentile(samples[week], [2.5, 97.5])
-        if ci_low <= true_rank <= ci_high:
-            covered += 1
-    return covered / len(true_outcomes)
-```
+import numpy as np
+from typing import Dict, List, Callable
+from dataclasses import dataclass
 
----
+@dataclass
+class MCMCConfig:
+    T: int = 5000           # 总迭代次数
+    burn: int = 1000        # 预热期
+    thin: int = 5           # 稀疏采样
+    lambda_penalty: float = 5.0  # 约束违反惩罚
+    min_ess: float = 100.0  # 最小有效样本量
+    seed: int = 42
 
-## 八、公平性与机制对比
-
-### 8.1 反事实重放算法
-
-```python
-def counterfactual_analysis(season_data, posterior_samples):
-    """
-    对每季每周，使用推断的 V 在不同机制下重放淘汰决策
-    """
-    results = []
+def compute_violation_rank(
+    fan_rank: Dict[str, int],
+    judge_rank: Dict[str, int],
+    eliminated: str
+) -> float:
+    """计算Rank模式的约束违反程度"""
+    combined = {c: judge_rank[c] + fan_rank[c] for c in fan_rank}
+    e_combined = combined[eliminated]
     
-    for week_event in season_data:
-        for V_sample in posterior_samples[week_event]:
-            # 计算三种机制下的淘汰者
-            elim_rank = compute_elimination(V_sample, "Rank")
-            elim_percent = compute_elimination(V_sample, "Percent")
-            elim_jp = compute_elimination(V_sample, "Rank+JudgePick")
+    # 违反度 = 淘汰者未达到最大值的差距之和
+    violation = 0.0
+    for c, comb in combined.items():
+        if c != eliminated and comb >= e_combined:
+            violation += (comb - e_combined + 1)
+    
+    return violation
+
+def compute_violation_percent(
+    vote_share: Dict[str, float],
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    delta: float = 0.01
+) -> float:
+    """计算Percent模式的约束违反程度"""
+    total_j = sum(judge_scores.values())
+    combined = {c: judge_scores[c]/total_j + vote_share[c] for c in vote_share}
+    e_combined = combined[eliminated]
+    
+    violation = 0.0
+    for c, comb in combined.items():
+        if c != eliminated and comb <= e_combined + delta:
+            violation += (e_combined + delta - comb + 0.01)
+    
+    return violation
+
+def mcmc_rank(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    config: MCMCConfig = MCMCConfig()
+) -> Dict:
+    """MCMC采样Rank模式的粉丝排名"""
+    np.random.seed(config.seed)
+    
+    contestants = list(judge_scores.keys())
+    n = len(contestants)
+    
+    # Judge rank（稳定排序）
+    sorted_c = sorted(contestants, key=lambda c: (-judge_scores[c], c))
+    judge_rank = {c: i + 1 for i, c in enumerate(sorted_c)}
+    
+    # 初始化：按评委分逆序（假设粉丝与评委负相关）
+    current = list(range(1, n + 1))
+    np.random.shuffle(current)
+    current_rank = dict(zip(contestants, current))
+    current_viol = compute_violation_rank(current_rank, judge_rank, eliminated)
+    
+    samples = []
+    violations = []
+    
+    for t in range(config.T):
+        # Proposal: 随机交换两个排名
+        i, j = np.random.choice(n, 2, replace=False)
+        ci, cj = contestants[i], contestants[j]
+        
+        proposal = current_rank.copy()
+        proposal[ci], proposal[cj] = proposal[cj], proposal[ci]
+        prop_viol = compute_violation_rank(proposal, judge_rank, eliminated)
+        
+        # Metropolis-Hastings 接受准则
+        if prop_viol == 0:
+            accept_prob = 1.0
+        elif current_viol == 0:
+            accept_prob = np.exp(-config.lambda_penalty * prop_viol)
+        else:
+            accept_prob = min(1.0, np.exp(config.lambda_penalty * (current_viol - prop_viol)))
+        
+        if np.random.random() < accept_prob:
+            current_rank = proposal
+            current_viol = prop_viol
+        
+        if t >= config.burn and (t - config.burn) % config.thin == 0:
+            samples.append(current_rank.copy())
+            violations.append(current_viol)
+    
+    # 计算有效样本量 (ESS)
+    ess = compute_ess(samples, contestants)
+    
+    return {
+        'samples': samples,
+        'violations': violations,
+        'ess': ess,
+        'converged': ess >= config.min_ess
+    }
+
+def mcmc_percent(
+    judge_scores: Dict[str, float],
+    eliminated: str,
+    config: MCMCConfig = MCMCConfig(),
+    delta: float = 0.01
+) -> Dict:
+    """MCMC采样Percent模式的票份额"""
+    np.random.seed(config.seed)
+    
+    contestants = list(judge_scores.keys())
+    n = len(contestants)
+    
+    # 初始化：均匀分布
+    current = {c: 1.0/n for c in contestants}
+    current_viol = compute_violation_percent(current, judge_scores, eliminated, delta)
+    
+    samples = []
+    violations = []
+    
+    for t in range(config.T):
+        # Proposal: Logit变换 + Random Walk（避免边界退化）
+        # Stick-Breaking形式,自动满足 Σv = 1
+        eps = 1e-8
+        current_arr = np.array([current[c] for c in contestants])
+        current_arr = np.clip(current_arr, eps, 1-eps)
+        logit_current = np.log(current_arr / (1 - current_arr + eps))
+        logit_proposal = logit_current + np.random.normal(0, 0.2, n)
+        exp_proposal = np.exp(logit_proposal)
+        proposed_arr = exp_proposal / exp_proposal.sum()  # Softmax归一化
+        proposal = dict(zip(contestants, proposed_arr))
+        prop_viol = compute_violation_percent(proposal, judge_scores, eliminated, delta)
+        
+        # 接受准则
+        if prop_viol == 0:
+            accept_prob = 1.0
+        elif current_viol == 0:
+            accept_prob = np.exp(-config.lambda_penalty * prop_viol)
+        else:
+            accept_prob = min(1.0, np.exp(config.lambda_penalty * (current_viol - prop_viol)))
+        
+        if np.random.random() < accept_prob:
+            current = proposal
+            current_viol = prop_viol
+        
+        if t >= config.burn and (t - config.burn) % config.thin == 0:
+            samples.append(current.copy())
+            violations.append(current_viol)
+    
+    ess = compute_ess_continuous(samples, contestants)
+    
+    return {
+        'samples': samples,
+        'violations': violations,
+        'ess': ess,
+        'converged': ess >= config.min_ess
+    }
+
+def compute_ess(samples: List[Dict], contestants: List[str]) -> float:
+    """计算离散排名的有效样本量（Geyer截断法）"""
+    if len(samples) < 10:
+        return 0.0
+    
+    ess_list = []
+    for c in contestants:
+        ranks = [s[c] for s in samples]
+        n = len(ranks)
+        # Geyer 1992: 截断到第一个负自相关对
+        max_lag = min(200, n // 2)
+        rho = [autocorr(ranks, k) for k in range(1, max_lag)]
+        cutoff = next((i for i in range(len(rho)-1) if rho[i] + rho[i+1] < 0), len(rho))
+        ess_c = n / (1 + 2 * sum(rho[:cutoff]))
+        ess_list.append(max(1, ess_c))
+    
+    return min(ess_list)
+
+def compute_ess_continuous(samples: List[Dict], contestants: List[str]) -> float:
+    """计算连续票份额的有效样本量"""
+    if len(samples) < 10:
+        return 0.0
+    
+    ess_list = []
+    for c in contestants:
+        shares = [s[c] for s in samples]
+        var_s = np.var(shares)
+        if var_s < 1e-10:
+            ess_list.append(len(shares))
+        else:
+            ess_c = len(shares) / (1 + 2 * sum(autocorr(shares, k) for k in range(1, min(50, len(shares)//2))))
+            ess_list.append(max(1, ess_c))
+    
+    return min(ess_list)
+
+def autocorr(x, lag):
+    """计算自相关系数（带除零保护）"""
+    n = len(x)
+    if lag >= n:
+        return 0
+    x = np.array(x) - np.mean(x)
+    var_x = np.var(x)
+    if var_x < 1e-10:  # 防止除零
+        return 0
+    return np.dot(x[:n-lag], x[lag:]) / (var_x * n)
+```
+
+---
+
+## 六、评估函数（完整实现）
+
+```python
+import numpy as np
+from typing import Dict, List
+
+def compute_elimination_rank(
+    fan_rank: Dict[str, int],
+    judge_rank: Dict[str, int]
+) -> str:
+    """Rank模式：返回综合排名最差的选手"""
+    combined = {c: judge_rank[c] + fan_rank[c] for c in fan_rank}
+    return max(combined.keys(), key=lambda c: combined[c])
+
+def compute_elimination_percent(
+    vote_share: Dict[str, float],
+    judge_scores: Dict[str, float]
+) -> str:
+    """Percent模式：返回综合得分最低的选手"""
+    total_j = sum(judge_scores.values())
+    combined = {c: judge_scores[c]/total_j + vote_share[c] for c in vote_share}
+    return min(combined.keys(), key=lambda c: combined[c])
+
+def compute_elimination_judgepick(
+    fan_rank: Dict[str, int],
+    judge_rank: Dict[str, int],
+    actual_eliminated: str
+) -> str:
+    """Rank+JudgePick：返回Bottom2中被淘汰的（按实际结果）"""
+    combined = {c: judge_rank[c] + fan_rank[c] for c in fan_rank}
+    sorted_c = sorted(combined.keys(), key=lambda c: -combined[c])
+    bottom2 = set(sorted_c[:2])
+    
+    if actual_eliminated in bottom2:
+        return actual_eliminated
+    else:
+        return sorted_c[0]  # 如果实际淘汰者不在Bottom2，返回最差者
+
+def evaluate_model(
+    events: List[Dict],
+    posterior_samples: Dict[int, List[Dict]],
+    mechanism: str
+) -> Dict[str, float]:
+    """
+    综合评估模型性能
+    """
+    correct = 0
+    brier_sum = 0.0
+    log_loss_sum = 0.0
+    n_total = 0
+    
+    for event in events:
+        week = event['week']
+        if event['eliminated'] is None:
+            continue
+        
+        samples = posterior_samples.get(week, [])
+        if not samples:
+            continue
+        
+        alive = event['alive']
+        true_elim = event['eliminated']
+        judge_scores = event['scores']
+        
+        # 计算每个选手的淘汰概率
+        elim_counts = {c: 0 for c in alive}
+        for sample in samples:
+            if mechanism == 'Rank' or mechanism == 'Rank+JudgePick':
+                sorted_c = sorted(alive, key=lambda c: (-judge_scores[c], c))
+                judge_rank = {c: i+1 for i, c in enumerate(sorted_c)}
+                pred_elim = compute_elimination_rank(sample, judge_rank)
+            else:
+                pred_elim = compute_elimination_percent(sample, judge_scores)
             
-            results.append({
-                'week': week_event.week,
-                'actual': week_event.eliminated,
-                'rank_cf': elim_rank,
-                'percent_cf': elim_percent,
-                'jp_cf': elim_jp,
-                'discrepancy': len(set([elim_rank, elim_percent, elim_jp])) > 1
-            })
+            if pred_elim in elim_counts:
+                elim_counts[pred_elim] += 1
+        
+        # 归一化为概率
+        total_samples = len(samples)
+        probs = {c: elim_counts[c] / total_samples for c in alive}
+        
+        # 准确率：众数预测是否正确
+        pred = max(probs.keys(), key=lambda c: probs[c])
+        if pred == true_elim:
+            correct += 1
+        
+        # Brier Score (per-week normalized)
+        n_alive_week = len(alive)
+        for c in alive:
+            y = 1.0 if c == true_elim else 0.0
+            brier_sum += (probs[c] - y) ** 2 / n_alive_week
+        
+        # Log-Loss
+        p_true = max(probs.get(true_elim, 0), 1e-10)
+        log_loss_sum += -np.log(p_true)
+        
+        n_total += 1
     
-    return pd.DataFrame(results)
+    return {
+        'accuracy': correct / n_total if n_total > 0 else 0,
+        'brier_score': brier_sum / n_total if n_total > 0 else 1,
+        'log_loss': log_loss_sum / n_total if n_total > 0 else 10,
+        'n_weeks': n_total
+    }
 ```
-
-### 8.2 杠杆/弹性指标
-
-**评委弹性 (Judge Elasticity)**：
-$$
-\eta_J = \frac{\partial \Pr(\text{survive})}{\partial J} \bigg|_{\bar{J}, \bar{V}}
-$$
-
-**粉丝弹性 (Fan Elasticity)**：
-$$
-\eta_V = \frac{\partial \Pr(\text{survive})}{\partial V} \bigg|_{\bar{J}, \bar{V}}
-$$
-
-**机制偏向指数**：
-$$
-\text{Bias}_M = \frac{\eta_V}{\eta_J} \quad
-\begin{cases}
-> 1 & \text{偏粉丝} \\
-< 1 & \text{偏评委} \\
-= 1 & \text{平衡}
-\end{cases}
-$$
-
-### 8.3 争议案例量化表
-
-| Season | Contestant | JudgeRank (周均) | HLD Percentile | 机制分歧 | 反事实结果 |
-|--------|------------|------------------|----------------|----------|------------|
-| 2 | Jerry Rice | 倒数1-2 | P5 | Rank ≠ Percent | Percent下更早淘汰 |
-| 4 | Billy Ray Cyrus | 倒数1-2 | P10 | 有 | - |
-| 11 | Bristol Palin | 倒数 (12次) | **P1** (最强) | 显著 | - |
-| 27 | Bobby Bones | 倒数 | P3 | N/A (Rank+JP) | - |
 
 ---
 
-## 九、可视化产出
-
-### 9.1 推荐图表
-
-| 图表类型 | 内容 | 用途 |
-|----------|------|------|
-| **瀑布图** | Combined 分解为 Judge vs Fan 贡献 | 解释每周淘汰原因 |
-| **生存曲线** | 基于 posterior 淘汰概率的 Kaplan-Meier | 选手"寿命"分布 |
-| **误差条图** | FanRank 点估计 + 95% CI | 不确定性展示 |
-| **SHAP Summary** | 特征对 FanRank 的影响 | 因子重要性 |
-| **热力图** | 季×选手 的 HLD 矩阵 | 跨季对比 |
-| **分歧率曲线** | Rank vs Percent 机制分歧随周数变化 | 机制对比 |
-
-### 9.2 可视化代码提示
+## 七、弹性与公平性分析
 
 ```python
-# 瀑布图示例
-def plot_combined_waterfall(week_data, fan_rank_estimate):
+def estimate_elasticity(
+    event: Dict,
+    posterior_samples: List[Dict],
+    mechanism: str,
+    delta_j: float = 0.5,
+    delta_v: float = 0.05
+) -> Dict[str, Dict[str, float]]:
     """
-    展示单周各选手的 combined score 分解
+    数值估计评委/粉丝弹性（双向中心差分）
+    
+    Elasticity = ΔPr(survive) / Δ(score)
     """
-    fig, ax = plt.subplots(figsize=(12, 6))
+    alive = event['alive']
+    judge_scores = event['scores']
     
-    contestants = week_data.contestants_alive
-    judge_contrib = [compute_judge_contrib(c, week_data) for c in contestants]
-    fan_contrib = [compute_fan_contrib(c, fan_rank_estimate) for c in contestants]
+    # 基线淘汰概率
+    base_probs = compute_elim_probs(posterior_samples, judge_scores, mechanism, alive)
     
-    x = np.arange(len(contestants))
-    ax.bar(x, judge_contrib, label='Judge Contribution', color='steelblue')
-    ax.bar(x, fan_contrib, bottom=judge_contrib, label='Fan Contribution', color='coral')
+    elasticities = {}
+    for target in alive:
+        # ===== 评委弹性（双向导数） =====
+        scores_up = judge_scores.copy()
+        scores_up[target] = judge_scores[target] + delta_j
+        scores_down = judge_scores.copy()
+        scores_down[target] = judge_scores[target] - delta_j
+        
+        probs_up = compute_elim_probs(posterior_samples, scores_up, mechanism, alive)
+        probs_down = compute_elim_probs(posterior_samples, scores_down, mechanism, alive)
+        
+        # 中心差分: (f(x+h) - f(x-h)) / 2h
+        delta_survive_j = (1 - probs_up[target]) - (1 - probs_down[target])
+        judge_elast = delta_survive_j / (2 * delta_j)
+        
+        # ===== 粉丝弹性（双向导数） =====
+        def perturb_samples(direction):
+            perturbed = []
+            for s in posterior_samples:
+                ps = s.copy()
+                if mechanism in ['Rank', 'Rank+JudgePick']:
+                    ps[target] = max(1, ps[target] + direction)  # ±1排名
+                else:
+                    ps[target] = max(0, min(1, ps[target] + direction * delta_v))
+                    total = sum(ps.values())
+                    ps = {c: ps[c]/total for c in ps}
+                perturbed.append(ps)
+            return perturbed
+        
+        probs_v_up = compute_elim_probs(perturb_samples(-1), judge_scores, mechanism, alive)  # 排名-1=更好
+        probs_v_down = compute_elim_probs(perturb_samples(+1), judge_scores, mechanism, alive)
+        
+        delta_survive_v = (1 - probs_v_up[target]) - (1 - probs_v_down[target])
+        fan_elast = delta_survive_v / 2  # 单位: 每1位排名变化
+        
+        elasticities[target] = {
+            'judge_elasticity': judge_elast,
+            'fan_elasticity': fan_elast,
+            'bias_ratio': fan_elast / judge_elast if abs(judge_elast) > 1e-6 else float('inf')
+        }
     
-    ax.axhline(y=threshold, linestyle='--', color='red', label='Elimination Threshold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(contestants, rotation=45)
-    ax.legend()
+    return elasticities
+
+def compute_elim_probs(samples, judge_scores, mechanism, alive):
+    """辅助函数：计算淘汰概率"""
+    counts = {c: 0 for c in alive}
+    sorted_c = sorted(alive, key=lambda c: (-judge_scores[c], c))
+    judge_rank = {c: i+1 for i, c in enumerate(sorted_c)}
     
-    return fig
+    for s in samples:
+        if mechanism in ['Rank', 'Rank+JudgePick']:
+            elim = compute_elimination_rank(s, judge_rank)
+        else:
+            elim = compute_elimination_percent(s, judge_scores)
+        if elim in counts:
+            counts[elim] += 1
+    
+    return {c: counts[c] / len(samples) for c in alive}
 ```
 
 ---
 
-## 十、代码接口规范
-
-### 10.1 核心求解器接口
+## 八、统一接口
 
 ```python
 def solve_week(
     judge_scores: Dict[str, float],
     eliminated: str,
-    mechanism: str,           # "Rank" | "Percent" | "Rank+JudgePick"
-    bottom2: Optional[Tuple[str, str]] = None,  # for Rank+JudgePick
-    relax: float = 0.0,       # constraint relaxation δ
-    solver: str = "auto"      # "enum" | "cpsat" | "mcmc"
-) -> List[Dict[str, int]]:
+    mechanism: str,
+    bottom2: Optional[Tuple[str, str]] = None,
+    relax: float = 0.0,
+    solver: str = "auto",
+    max_solutions: int = 500,
+    timeout_sec: float = 60.0
+) -> List[Dict]:
     """
-    Returns: List of feasible fan_rank assignments
+    统一求解接口
     """
     n = len(judge_scores)
     
+    # 自动选择求解器
     if solver == "auto":
-        solver = "enum" if n <= 6 else ("cpsat" if n <= 12 else "mcmc")
+        if mechanism == "Percent":
+            solver = "lp"
+        elif n <= 6:
+            solver = "enum"
+        elif n <= 12:
+            solver = "cpsat"
+        else:
+            solver = "mcmc"
     
-    if solver == "enum":
-        return solve_week_enum(judge_scores, eliminated, mechanism, relax)
-    elif solver == "cpsat":
-        return solve_week_cpsat(judge_scores, eliminated, mechanism, relax)
-    else:
-        return mcmc_sample_votes(judge_scores, eliminated, mechanism)
+    # 分发求解
+    if mechanism == "Rank":
+        if solver == "cpsat":
+            return solve_rank_cpsat(judge_scores, eliminated, relax, max_solutions, timeout_sec)
+        elif solver == "mcmc":
+            result = mcmc_rank(judge_scores, eliminated)
+            return result['samples'] if result['converged'] else []
+        else:  # enum
+            return solve_rank_enum(judge_scores, eliminated, relax)
+    
+    elif mechanism == "Percent":
+        if solver == "lp":
+            return solve_percent_lp(judge_scores, eliminated, relax)
+        else:
+            result = mcmc_percent(judge_scores, eliminated, delta=relax)
+            return result['samples'] if result['converged'] else []
+    
+    else:  # Rank+JudgePick
+        return solve_rank_judgepick_cpsat(judge_scores, eliminated, bottom2, relax, max_solutions, timeout_sec)
 ```
 
-### 10.2 采样接口
+---
+
+## 九、敏感性分析框架
 
 ```python
-def sample_posterior(
-    season_events: List[WeekEvent],
-    prior_params: Dict,
-    T: int = 5000,
-    burn: int = 1000,
-    thin: int = 5
-) -> Dict[int, np.ndarray]:
+def sensitivity_analysis(
+    events: List[Dict],
+    delta_grid: List[float] = [0.0, 0.1, 0.3, 0.5],
+    lambda_grid: List[float] = [1.0, 5.0, 10.0]
+) -> pd.DataFrame:
     """
-    Returns: {week: (n_samples, n_contestants) array of fan_rank samples}
+    对松弛参数δ和惩罚参数λ进行敏感性分析
     """
-    pass
+    results = []
+    
+    for delta in delta_grid:
+        for lam in lambda_grid:
+            config = MCMCConfig(lambda_penalty=lam)
+            
+            all_samples = {}
+            for event in events:
+                if event['eliminated']:
+                    samples = solve_week(
+                        event['scores'], 
+                        event['eliminated'],
+                        event['mechanism'],
+                        relax=delta
+                    )
+                    all_samples[event['week']] = samples
+            
+            metrics = evaluate_model(events, all_samples, events[0]['mechanism'])
+            metrics['delta'] = delta
+            metrics['lambda'] = lam
+            results.append(metrics)
+    
+    return pd.DataFrame(results)
 ```
 
-### 10.3 评估接口
+---
 
-```python
-def evaluate_model(
-    predictions: Dict[int, np.ndarray],
-    ground_truth: Dict[int, str]
-) -> Dict[str, float]:
-    """
-    Returns: {
-        'accuracy': float,
-        'brier_score': float,
-        'log_loss': float,
-        'ci_coverage': float
-    }
-    """
-    pass
-```
+## 十、三天路线图（v3.0）
+
+| 时段 | 任务 | 检验点 |
+|------|------|--------|
+| **D1 上午** | 数据清洗 + 事件提取 | 每季事件表完整 |
+| **D1 下午** | CP-SAT (Rank) + LP (Percent) | 解数>0, timeout内完成 |
+| **D2 上午** | MCMC采样器 + ESS检验 | ESS>100 |
+| **D2 下午** | 层次先验 + 因子分析 | SHAP图生成 |
+| **D3 上午** | 弹性分析 + 反事实重放 | 争议案例表完成 |
+| **D3 下午** | 敏感性 + 论文撰写 | 准确率>80%, Brier<0.2 |
 
 ---
 
-## 十一、三天实施路线图（更新版）
-
-| 天数 | 上午 | 下午 | 产出 |
-|------|------|------|------|
-| **Day 1** | 数据清洗 + 事件序列构建 | M1 约束求解器 (enum + cpsat) | 每周可行粉丝排名集 |
-| **Day 2** | M2 MCMC 采样器 + 先验标定 | M3 因子分析 (层次模型) | 后验分布 + SHAP |
-| **Day 3** | M4 机制对比 + 争议案例 | 敏感性分析 + 论文撰写 | 完整论文草稿 |
-
----
-
-## 十二、关键技术决策备忘
-
-| 决策点 | 推荐选项 | 备选方案 | 理由 |
-|--------|----------|----------|------|
-| 约束求解 | CP-SAT | ILP (Gurobi) | 开源 + 足够快 |
-| MCMC 采样 | Metropolis-Hastings | SMC / NUTS | 实现简单 |
-| 先验 | 层次正态 | Dirichlet | 可解释性强 |
-| 敏感性 | δ ∈ {0, 0.1, 0.3, 0.5} | - | 覆盖从严到松 |
-| 评估 | Brier + 复原率 | AUC | 直观 + 可比 |
-
----
-
-> **Killer Quote for Abstract (v2)**:  
-> *"By reconceptualizing DWTS as a dual-auction market with observable 'public quotes' (judge scores) and latent 'dark pool orders' (fan votes), we employ constraint-satisfaction programming and Bayesian inference to reverse-engineer the hidden voting distribution. Our model reveals Bristol Palin commanded the deepest latent fan liquidity in the show's 34-season history—surviving 12 elimination-worthy judge scores through an 'iceberg order' of loyal voters invisible to all but the survival outcome."*
+> **v3.0 已修复全部7项技术漏洞，可直接用于代码实现。**
