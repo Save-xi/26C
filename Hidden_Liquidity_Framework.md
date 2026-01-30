@@ -1,6 +1,6 @@
-# Hidden Liquidity Inference Framework v3.4
+# Hidden Liquidity Inference Framework v3.5
 
-> v3.4: 添加空集/除零保护、统一机制判定函数、添加feasibility_rate指标。
+> v3.5: 完善所有计算函数空集保护，评估链路使用有效样本计数避免除零。
 
 ---
 
@@ -1002,12 +1002,15 @@ def compute_elimination_judgepick(
     judge_rank: Dict[str, int],
     actual_eliminated: str,
     alive: Optional[set] = None
-) -> str:
-    """Rank+JudgePick：返回Bottom2中被淘汰的（按实际结果）"""
+) -> Optional[str]:
+    """Rank+JudgePick：返回Bottom2中被淘汰的（过滤辅助键，空集保护）"""
     valid_keys = set(judge_rank.keys())
     if alive:
         valid_keys = valid_keys & set(alive)
-    filtered = {c: fan_rank[c] for c in fan_rank if c in valid_keys}
+    # 过滤辅助键
+    filtered = {c: fan_rank[c] for c in fan_rank if c in valid_keys and not str(c).startswith('_')}
+    if len(filtered) < 2:
+        return None  # 空集保护：需要至少2人才能形成Bottom2
     combined = {c: judge_rank[c] + filtered[c] for c in filtered}
     sorted_c = sorted(combined.keys(), key=lambda c: -combined[c])
     bottom2 = set(sorted_c[:2])
@@ -1015,7 +1018,7 @@ def compute_elimination_judgepick(
     if actual_eliminated in bottom2:
         return actual_eliminated
     else:
-        return sorted_c[0]
+        return sorted_c[0] if sorted_c else None
 
 def evaluate_model(
     events: List[Dict],
@@ -1076,8 +1079,13 @@ def evaluate_model(
             if pred_elim in elim_counts:
                 elim_counts[pred_elim] += 1
         
-        total_samples = len(samples)
-        probs = {c: elim_counts[c] / total_samples for c in alive}
+        # 计算有效样本数（非None的预测）
+        valid_sample_count = sum(elim_counts.values())
+        if valid_sample_count == 0:
+            n_skipped += 1  # 所有样本都返回None，跳过
+            continue
+        
+        probs = {c: elim_counts[c] / valid_sample_count for c in alive}
         
         pred = max(probs.keys(), key=lambda c: probs[c])
         if pred == true_elim:
@@ -1113,20 +1121,28 @@ def compute_elimination_judgepick_with_bottom2(
     bottom2: Tuple[str, str],
     actual_eliminated: str,
     alive: Optional[set] = None
-) -> str:
+) -> Optional[str]:
     """
-    Rank+JudgePick：在给定Bottom2限制下返回淘汰者（过滤辅助键）
+    Rank+JudgePick：在给定Bottom2限制下返回淘汰者（过滤辅助键，空集保护）
     """
+    if not bottom2 or len(bottom2) < 2:
+        return None  # Bottom2无效
+    
     valid_keys = set(judge_rank.keys())
     if alive:
         valid_keys = valid_keys & set(alive)
     
-    if actual_eliminated in bottom2:
+    # 验证bottom2成员在valid_keys中
+    b2_valid = [c for c in bottom2 if c in valid_keys and not str(c).startswith('_')]
+    if not b2_valid:
+        return None  # Bottom2成员不在有效集合中
+    
+    if actual_eliminated in b2_valid:
         return actual_eliminated
     else:
-        filtered = {c: fan_rank.get(c, 999) for c in bottom2 if c in valid_keys}
-        combined = {c: judge_rank[c] + filtered[c] for c in filtered}
-        return max(combined.keys(), key=lambda c: combined[c]) if combined else bottom2[0]
+        filtered = {c: fan_rank.get(c, 999) for c in b2_valid}
+        combined = {c: judge_rank.get(c, 999) + filtered[c] for c in filtered}
+        return max(combined.keys(), key=lambda c: combined[c]) if combined else None
 ```
 
 ---
