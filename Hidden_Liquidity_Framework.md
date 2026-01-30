@@ -26,6 +26,109 @@ DEFAULT_SEED = 42
 
 ---
 
+## 〇.五、任务定义与输出格式
+
+### 0.5.1 赛题核心问题拆解
+
+本框架旨在解决 MCM 2026 Problem C 的以下核心问题：
+
+| 问题维度 | 具体要求 | 技术路径 |
+|---------|---------|---------|
+| **推断隐形粉丝票** | 从淘汰结果反推粉丝投票分布 | 约束求解（CP-SAT/LP/MCMC） |
+| **一致性检验** | 模型预测与实际淘汰的吻合度 | 正确淘汰率、Brier Score、Log-Loss |
+| **不确定性量化** | 给出粉丝票的置信区间/概率分布 | 可行域采样、后验密度估计 |
+| **机制比较** | Rank vs Percent vs Rank+JudgePick | 准确率、不确定性、计算成本对比 |
+| **明星/舞伴影响** | 量化选手属性对粉丝偏好的影响 | 层次贝叶斯模型、SHAP特征重要性 |
+
+### 0.5.2 输出数据结构定义
+
+#### 主输出：每周粉丝投票估计
+
+```python
+# DataFrame 格式（每行一个选手-周组合）
+columns = [
+    'Season',              # int: 赛季编号
+    'Week',                # int: 周次
+    'Contestant',          # str: 选手名
+    'Judge_Score',         # float: 评委总分
+    'Judge_Rank',          # int: 评委排名（1=最高）
+    
+    # ===== 推断结果 =====
+    'Fan_Rank_Mean',       # float: Rank模式粉丝排名均值
+    'Fan_Rank_Lower',      # int: 可行域下界
+    'Fan_Rank_Upper',      # int: 可行域上界
+    
+    'Fan_VoteShare_Mean',  # float: Percent模式票份额均值
+    'Fan_VoteShare_Lower', # float: 可行域下界
+    'Fan_VoteShare_Upper', # float: 可行域上界
+    
+    # ===== 不确定性指标 =====
+    'Uncertainty_Entropy', # float: Shannon熵（越高=越不确定）
+    'Uncertainty_Range',   # float: 可行域宽度（Upper - Lower）
+    'Num_Feasible_Solutions', # int: 可行解数量
+    
+    # ===== 一致性标记 =====
+    'Is_Eliminated',       # bool: 是否本周被淘汰
+    'Predicted_Elimination_Prob', # float: 模型预测淘汰概率
+    'Is_Controversial',    # bool: 高不确定性选手标记
+]
+```
+
+#### 辅助输出：一致性评估摘要
+
+```python
+# 跨季汇总指标
+summary_metrics = {
+    'Overall_Accuracy': float,      # 正确淘汰匹配率
+    'Brier_Score': float,           # 概率校准度
+    'Feasibility_Rate': float,      # 可行解存在比例
+    'Avg_Uncertainty': float,       # 平均熵/区间宽度
+    
+    # 分机制统计
+    'Rank_Accuracy': float,
+    'Percent_Accuracy': float,
+    'RankJudgePick_Accuracy': float,
+    
+    # 争议案例
+    'Controversial_Weeks': List[Tuple[int, int]],  # [(season, week), ...]
+    'High_Uncertainty_Contestants': List[str],
+}
+```
+
+### 0.5.3 评价指标体系
+
+#### 一致性指标
+
+| 指标 | 定义 | 计算公式 | 优秀阈值 |
+|------|------|---------|---------|
+| **正确淘汰率** | 预测淘汰者与实际一致的比例 | `Σ(pred == actual) / N` | ≥ 80% |
+| **Brier Score** | 概率预测的均方误差 | `Σ(p - y)² / N` | ≤ 0.2 |
+| **Log-Loss** | 对数损失（惩罚自信错误） | `-Σlog(p_true) / N` | ≤ 1.0 |
+| **可行解存在率** | 有可行解的周占比 | `Σ(solutions > 0) / N` | ≥ 95% |
+
+#### 不确定性指标
+
+| 指标 | 定义 | 计算方法 | 争议阈值 |
+|------|------|---------|---------|
+| **Shannon熵** | 粉丝投票分布的信息熵 | `-Σ p_i log(p_i)` | > 0.8 |
+| **区间宽度** | 可行域上下界差距 | `Upper - Lower` | > 50%范围 |
+| **置信区间覆盖率** | 真实值落在区间内的比例 | `Σ(true ∈ [L, U]) / N` | ≥ 90% |
+
+#### 机制比较维度
+
+```python
+comparison_table = {
+    'Mechanism': ['Rank', 'Percent', 'Rank+JudgePick'],
+    'Accuracy': [...],
+    'Avg_Uncertainty': [...],
+    'Computation_Time': [...],  # 秒
+    'Solution_Count': [...],    # 平均可行解数
+    'Controversial_Rate': [...], # 高熵周占比
+}
+```
+
+---
+
 ## 一、三种机制的精确约束建模
 
 ### 1.1 Rank 模式 (S1-2)
@@ -86,7 +189,113 @@ eliminated ∈ {a, b}  (外部给定，非求解)
 
 ---
 
-## 二、数据提取流程（从 CSV 到事件序列）
+## 二、数据预处理规范与提取流程
+
+### 2.0 数据预处理规范
+
+#### 2.0.1 必需字段清单与类型约束
+
+> **实际CSV 结构**（2026_MCM_Problem_C_Data.csv）
+
+| 字段名 | 类型 | 说明 | 示例 |
+|-------|------|------|------|
+| `celebrity_name` | str | 选手（Celebrity）姓名 | "Jordan Fisher" |
+| `ballroom_partner` | str | 舞伴名（专业舞者） | "Lindsay Arnold" |
+| `celebrity_industry` | str | 选手行业领域 | "Actor/Actress", "Athlete" |
+| `celebrity_age_during_season` | int | 参赛时年龄 | 23 |
+| `season` | int | 赛季编号 | 1, 2, ..., 34 |
+| `results` | str | 最终结果（含淘汰周信息） | "Eliminated Week 3", "1st Place", "Withdrew" |
+| `placement` | int | 最终排名 | 1, 2, 3, ... |
+| `weekN_judgeM_score` | float/str | N=周次(1-11), M=评委(1-4) | 9.0, "N/A", 0 |
+
+**关键发现**：
+- **无粉丝票份额**：CSV 中没有 `weekN_fan_percent` 列，粉丝数据是"隐形"的
+- **无显式淘汰标记**：需从 `results` 列解析淘汰周次
+- **无 Bottom2 数据**：需从约束求解中反推
+
+**淘汰信息解析规则**：
+```python
+def parse_elimination_info(results: str) -> Tuple[Optional[int], str]:
+    """
+    从 results 列解析淘汰周次和淘汰类型
+    
+    Returns:
+        (eliminated_week, elimination_type)
+        - eliminated_week: 淘汰周次（None 表示进入决赛或退赛）
+        - elimination_type: 'eliminated', 'withdrew', 'finalist1-4'
+    """
+    results = results.strip()
+    
+    if results.startswith('Eliminated Week'):
+        week = int(results.replace('Eliminated Week ', ''))
+        return (week, 'eliminated')
+    elif results == 'Withdrew':
+        return (None, 'withdrew')
+    elif 'Place' in results:
+        return (None, f'finalist{results[0]}')  # "1st Place" -> "finalist1"
+    else:
+        return (None, 'unknown')
+```
+
+#### 2.0.2 特殊值语义与处理规则
+
+| 值类型 | 含义 | 处理策略 | 代码示例 |
+|-------|------|---------|---------|
+| `N/A` (字符串) | 数据缺失（未参赛、未评分） | 视为 `None`，跳过该选手 | `safe_get(row, col, None)` |
+| `0` (数值) | 实际得分为0（极罕见） | 保留为有效值 | 直接使用 |
+| `""` (空串) | 无淘汰（Week 1等） | `eliminated = None` | `if val == '': eliminated = None` |
+| `NaN` (pandas) | 数据缺失 | 同 `N/A` 处理 | `pd.isna(val)` |
+| `Withdrew` | 选手退赛 | 标记为特殊淘汰，不参与建模 | `if 'withdraw' in val.lower()` |
+
+#### 2.0.3 多舞蹈评分合并策略
+
+某些周（如 Finale）选手跳多支舞，每支舞独立评分。合并规则：
+
+```python
+# 方案1：求和（DWTS 官方规则）
+total_score = sum([score1, score2, ...])  # 多舞总分
+
+# 方案2：加权平均（若舞蹈权重不同）
+weighted_score = w1*score1 + w2*score2  # 需外部权重数据
+
+# 本框架默认：取总分
+def merge_multi_dance_scores(row, week):
+    scores = []
+    for dance_idx in [1, 2, ...]:  # 最多3支舞
+        col = f'week{week}_dance{dance_idx}_judge_total'
+        if col in row.index and pd.notna(row[col]):
+            scores.append(row[col])
+    return sum(scores) if scores else None
+```
+
+#### 2.0.4 特殊周标识与约束调整
+
+| 周类型 | 特征 | 约束调整 | 检测规则 |
+|-------|------|---------|---------|
+| **无淘汰周** | Week 1, Finale前夜 | 跳过建模 | `eliminated is None` |
+| **多淘汰周** | Week 10（S28+） | 双重约束求解 | `len(eliminated_list) > 1` |
+| **Finale** | 最后一周，3-4名排名 | 改为排序约束 | `week == max_week` |
+| **Bottom2公开周** | S28+ 部分周 | 额外约束 `eliminated ∈ bottom2` | `bottom2_data.get((season, week))` |
+
+#### 2.0.5 机制自动判定逻辑
+
+```python
+def detect_mechanism(season, week):
+    """根据赛季和周次自动识别合并机制"""
+    if season <= 2:
+        return 'Rank'  # S1-2: Judge排名+粉丝排名
+    elif 3 <= season <= 27:
+        return 'Percent'  # S3-27: Judge百分比+粉丝百分比
+    elif season >= 28:
+        # S28+: Rank+JudgePick
+        if week <= 3:
+            return 'Rank'  # 前几周可能仍是旧制
+        else:
+            return 'Rank+JudgePick'
+    else:
+        warnings.warn(f"未知赛季 {season}，默认 Rank")
+        return 'Rank'
+```
 
 ### 2.1 淘汰识别算法
 
@@ -891,6 +1100,224 @@ def compute_elimination_judgepick_with_bottom2(
 
 ---
 
+## 六点五、不确定性量化方法
+
+### 6.5.1 可行域表征
+
+不同求解器返回的可行解集合可用于量化粉丝投票的不确定性范围：
+
+| 求解器 | 可行解类型 | 不确定性度量 | 代码接口 |
+|-------|----------|------------|---------|
+| **CP-SAT** | 离散解集（最多500个） | 解的分布直方图 | `solutions = solve_rank_cpsat(...)` |
+| **LP采样** | 可行域边界点（100个） | 区间上下界 | `samples = solve_percent_lp(...)` |
+| **MCMC** | 后验分布样本（稀疏后~1000个） | 概率密度估计 | `result['samples']` |
+| **枚举法** | 全排列（n≤6时）| 精确分布 | `solve_rank_enum(...)` |
+
+#### 可行域边界计算
+
+```python
+def compute_feasible_bounds(samples: List[Dict], contestant: str) -> Tuple[float, float]:
+    """
+    计算某选手的粉丝投票可行域边界
+    
+    Args:
+        samples: solve_* 返回的样本列表
+        contestant: 选手名
+    
+    Returns:
+        (lower_bound, upper_bound)
+    """
+    values = [s[contestant] for s in samples if contestant in s]
+    if not values:
+        return (None, None)
+    return (min(values), max(values))
+
+# 示例：Rank模式
+solutions = solve_rank_cpsat(judge_scores, eliminated, relax=0.0)
+for c in contestants:
+    lower, upper = compute_feasible_bounds(solutions, c)
+    print(f"{c}: Fan_Rank ∈ [{lower}, {upper}]")
+```
+
+### 6.5.2 置信区间计算
+
+#### Rank模式：离散分布的分位数
+
+```python
+def compute_rank_credible_interval(
+    samples: List[Dict],
+    contestant: str,
+    alpha: float = 0.05
+) -> Tuple[int, int]:
+    """
+    计算 (1-alpha)% 置信区间（分位数方法）
+    
+    Returns:
+        (lower_quantile, upper_quantile)
+    """
+    ranks = [s[contestant] for s in samples if contestant in s]
+    if not ranks:
+        return (None, None)
+    
+    ranks_sorted = sorted(ranks)
+    n = len(ranks_sorted)
+    lower_idx = int(n * alpha / 2)
+    upper_idx = int(n * (1 - alpha / 2))
+    
+    return (ranks_sorted[lower_idx], ranks_sorted[upper_idx])
+```
+
+#### Percent模式：连续分布的HPD区间
+
+```python
+def compute_percent_hpd_interval(
+    samples: List[Dict],
+    contestant: str,
+    alpha: float = 0.05
+) -> Tuple[float, float]:
+    """
+    计算最高后验密度(HPD)区间
+    """
+    shares = np.array([s[contestant] for s in samples if contestant in s])
+    if len(shares) == 0:
+        return (None, None)
+    
+    # 使用核密度估计构建分布
+    from scipy.stats import gaussian_kde
+    kde = gaussian_kde(shares)
+    
+    # 找到包含 (1-alpha) 概率质量的最窄区间
+    sorted_shares = np.sort(shares)
+    n = len(sorted_shares)
+    interval_len = int(n * (1 - alpha))
+    
+    best_interval = None
+    min_width = float('inf')
+    
+    for i in range(n - interval_len + 1):
+        lower = sorted_shares[i]
+        upper = sorted_shares[i + interval_len - 1]
+        width = upper - lower
+        if width < min_width:
+            min_width = width
+            best_interval = (lower, upper)
+    
+    return best_interval
+```
+
+### 6.5.3 Shannon熵与信息量
+
+#### 熵的定义与计算
+
+```python
+def compute_shannon_entropy(samples: List[Dict], contestant: str) -> float:
+    """
+    计算选手粉丝投票的Shannon熵
+    
+    H = -Σ p_i log(p_i)
+    
+    熵值解释：
+    - H ≈ 0: 高度确定（几乎所有样本一致）
+    - H ≈ log(n): 高度不确定（均匀分布）
+    """
+    from collections import Counter
+    values = [s[contestant] for s in samples if contestant in s]
+    if not values:
+        return None
+    
+    # 统计频次
+    counts = Counter(values)
+    total = len(values)
+    
+    # 计算熵
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        if p > 0:
+            entropy -= p * np.log(p)
+    
+    return entropy
+
+def identify_controversial_contestants(
+    all_samples: Dict[Tuple[int,int], List[Dict]],
+    events: List[Dict],
+    entropy_threshold: float = 0.8
+) -> List[Dict]:
+    """
+    识别高不确定性（争议）选手
+    
+    Returns:
+        List of {
+            'season': int,
+            'week': int,
+            'contestant': str,
+            'entropy': float,
+            'rank_range': (int, int),
+        }
+    """
+    controversial = []
+    
+    for event in events:
+        key = (event['season'], event['week'])
+        samples = all_samples.get(key, [])
+        if not samples:
+            continue
+        
+        for contestant in event['alive']:
+            entropy = compute_shannon_entropy(samples, contestant)
+            if entropy and entropy > entropy_threshold:
+                lower, upper = compute_feasible_bounds(samples, contestant)
+                controversial.append({
+                    'season': event['season'],
+                    'week': event['week'],
+                    'contestant': contestant,
+                    'entropy': entropy,
+                    'rank_range': (lower, upper),
+                })
+    
+    return controversial
+```
+
+#### 相对熵（KL散度）用于机制比较
+
+```python
+def compute_kl_divergence(
+    samples_p: List[Dict],  # 机制P的样本
+    samples_q: List[Dict],  # 机制Q的样本
+    contestant: str
+) -> float:
+    """
+    计算两种机制下粉丝投票分布的KL散度
+    
+    KL(P||Q) = Σ p_i log(p_i / q_i)
+    
+    用途：量化两种机制对同一选手的推断差异
+    """
+    from collections import Counter
+    
+    # 构建概率分布
+    values_p = [s[contestant] for s in samples_p if contestant in s]
+    values_q = [s[contestant] for s in samples_q if contestant in s]
+    
+    counts_p = Counter(values_p)
+    counts_q = Counter(values_q)
+    
+    total_p = len(values_p)
+    total_q = len(values_q)
+    
+    # 计算KL散度
+    kl = 0.0
+    for value in counts_p:
+        p = counts_p[value] / total_p
+        q = counts_q.get(value, 1e-10) / total_q  # 平滑处理
+        if p > 0:
+            kl += p * np.log(p / q)
+    
+    return kl
+```
+
+---
+
 ## 七、弹性与公平性分析
 
 ```python
@@ -1093,6 +1520,247 @@ def sensitivity_analysis(
             results.append(metrics)
     
     return pd.DataFrame(results)
+```
+
+---
+
+## 〇.九五、实验设计与输出
+
+### 9.5.1 Rank vs Percent 机制比较实验
+
+#### 实验设计
+
+```python
+def compare_mechanisms(
+    events: List[Dict],
+    mechanisms: List[str] = ['Rank', 'Percent']
+) -> pd.DataFrame:
+    """
+    对比不同机制的性能
+    
+    控制变量：同一数据集（相同的Judge分数、淘汰结果）
+    对比维度：准确率、不确定性、计算成本
+    """
+    results = []
+    
+    for mechanism in mechanisms:
+        # 求解每周
+        all_samples = {}
+        computation_times = []
+        
+        for event in events:
+            if event['eliminated'] is None:
+                continue
+            
+            key = (event['season'], event['week'])
+            
+            # 计时
+            import time
+            start = time.time()
+            
+            samples, _ = solve_week(
+                event['scores'],
+                event['eliminated'],
+                mechanism,
+                solver='auto'
+            )
+            
+            elapsed = time.time() - start
+            computation_times.append(elapsed)
+            
+            if samples:
+                all_samples[key] = samples
+        
+        # 评估
+        metrics = evaluate_model(events, all_samples, bottom2_data=None)
+        
+        # 计算不确定性
+        avg_entropy = []
+        for key, samples in all_samples.items():
+            for contestant in samples[0].keys():
+                if not contestant.startswith('_'):
+                    entropy = compute_shannon_entropy(samples, contestant)
+                    if entropy:
+                        avg_entropy.append(entropy)
+        
+        results.append({
+            'Mechanism': mechanism,
+            'Accuracy': metrics['accuracy'],
+            'Brier_Score': metrics['brier_score'],
+            'Avg_Entropy': np.mean(avg_entropy) if avg_entropy else None,
+            'Avg_Computation_Time_sec': np.mean(computation_times),
+            'Feasibility_Rate': (len(all_samples) / len([e for e in events if e['eliminated']])),
+        })
+    
+    return pd.DataFrame(results)
+
+# 使用示例
+comparison = compare_mechanisms(events, ['Rank', 'Percent', 'Rank+JudgePick'])
+print(comparison.to_markdown())
+```
+
+#### 可视化输出
+
+```python
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def visualize_mechanism_comparison(comparison_df: pd.DataFrame):
+    """
+    生成机制对比可视化
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # 1. 准确率对比
+    axes[0, 0].bar(comparison_df['Mechanism'], comparison_df['Accuracy'])
+    axes[0, 0].set_title('Prediction Accuracy by Mechanism')
+    axes[0, 0].set_ylabel('Accuracy')
+    axes[0, 0].set_ylim([0, 1])
+    
+    # 2. 不确定性对比
+    axes[0, 1].bar(comparison_df['Mechanism'], comparison_df['Avg_Entropy'])
+    axes[0, 1].set_title('Average Uncertainty (Entropy)')
+    axes[0, 1].set_ylabel('Shannon Entropy')
+    
+    # 3. 计算成本对比
+    axes[1, 0].bar(comparison_df['Mechanism'], comparison_df['Avg_Computation_Time_sec'])
+    axes[1, 0].set_title('Computation Time')
+    axes[1, 0].set_ylabel('Seconds per Week')
+    
+    # 4. Brier Score 对比
+    axes[1, 1].bar(comparison_df['Mechanism'], comparison_df['Brier_Score'])
+    axes[1, 1].set_title('Brier Score (lower is better)')
+    axes[1, 1].set_ylabel('Brier Score')
+    
+    plt.tight_layout()
+    plt.savefig('mechanism_comparison.png', dpi=300)
+    plt.show()
+```
+
+### 9.5.2 争议选手深度分析
+
+####Top-N 高不确定性选手识别
+
+```python
+def generate_controversial_report(
+    all_samples: Dict[Tuple[int,int], List[Dict]],
+    events: List[Dict],
+    top_n: int = 10
+) -> pd.DataFrame:
+    """
+    生成争议选手报告
+    """
+    controversial = identify_controversial_contestants(all_samples, events)
+    
+    # 按熵排序
+    controversial_sorted = sorted(controversial, key=lambda x: x['entropy'], reverse=True)
+    
+    # 转为DataFrame
+    df = pd.DataFrame(controversial_sorted[:top_n])
+    
+    # 添加额外信息
+    df['Range_Width'] = df['rank_range'].apply(lambda r: r[1] - r[0] if r else None)
+    
+    return df[['season', 'week', 'contestant', 'entropy', 'range_width', 'rank_range']]
+
+# 使用示例
+controversial_report = generate_controversial_report(all_samples, events, top_n=20)
+print("\n=== Top 20 Most Controversial Contestants ===")
+print(controversial_report.to_markdown())
+```
+
+#### 个案可行域可视化
+
+```python
+def visualize_feasible_region(
+    samples: List[Dict],
+    contestant: str,
+    mechanism: str
+):
+    """
+    可视化某选手的粉丝投票可行域分布
+    """
+    values = [s[contestant] for s in samples if contestant in s]
+    
+    plt.figure(figsize=(10, 6))
+    
+    if mechanism == 'Rank':
+        # 离散分布直方图
+        unique, counts = np.unique(values, return_counts=True)
+        plt.bar(unique, counts / len(values))
+        plt.xlabel('Fan Rank')
+        plt.ylabel('Probability')
+        plt.title(f'{contestant} - Fan Rank Distribution ({mechanism} mechanism)')
+    
+    elif mechanism == 'Percent':
+        # 连续分布核密度估计
+        from scipy.stats import gaussian_kde
+        kde = gaussian_kde(values)
+        x = np.linspace(min(values), max(values), 100)
+        plt.plot(x, kde(x))
+        plt.fill_between(x, kde(x), alpha=0.3)
+        plt.xlabel('Fan Vote Share')
+        plt.ylabel('Density')
+        plt.title(f'{contestant} - Vote Share Distribution ({mechanism} mechanism)')
+    
+    plt.grid(alpha=0.3)
+    plt.savefig(f'{contestant}_feasible_region.png', dpi=300)
+    plt.show()
+```
+
+### 9.5.3 制度建议生成
+
+#### 量化决策树
+
+```python
+def generate_mechanism_recommendation(comparison_df: pd.DataFrame) -> str:
+    """
+    基于实验指标生成制度建议
+    """
+    # 提取指标
+    rank_acc = comparison_df[comparison_df['Mechanism']=='Rank']['Accuracy'].values[0]
+    percent_acc = comparison_df[comparison_df['Mechanism']=='Percent']['Accuracy'].values[0]
+    
+    rank_entropy = comparison_df[comparison_df['Mechanism']=='Rank']['Avg_Entropy'].values[0]
+    percent_entropy = comparison_df[comparison_df['Mechanism']=='Percent']['Avg_Entropy'].values[0]
+    
+    # 决策逻辑
+    recommendations = []
+    
+    if rank_acc > percent_acc + 0.05:
+        recommendations.append("**推荐 Rank 机制**：准确率显著高于 Percent")
+    elif percent_acc > rank_acc + 0.05:
+        recommendations.append("**推荐 Percent 机制**：准确率显著高于 Rank")
+    else:
+        recommendations.append("**Rank 与 Percent 准确率相当**")
+        
+        if rank_entropy < percent_entropy:
+            recommendations.append("  - Rank 机制不确定性更低，推断更可靠")
+        else:
+            recommendations.append("  - Percent 机制不确定性更低，推断更可靠")
+    
+    # 生成报告
+    report = "\\n".join(recommendations)
+    
+    report += "\n\n### 优缺点权衡表\n\n"
+    report += "| 维度 | Rank | Percent | Rank+JudgePick |\n"
+    report += "|------|------|---------|----------------|\n"
+    report += "| **准确率** | {:.1%} | {:.1%} | {:.1%} |\n".format(
+        rank_acc, percent_acc,
+        comparison_df[comparison_df['Mechanism']=='Rank+JudgePick']['Accuracy'].values[0]
+    )
+    report += "| **不确定性** | {:.2f} | {:.2f} | {:.2f} |\n".format(
+        rank_entropy, percent_entropy,
+        comparison_df[comparison_df['Mechanism']=='Rank+JudgePick']['Avg_Entropy'].values[0]
+    )
+    report += "| **计算成本** | 低 | 中 | 高 |\n"
+    report += "| **可解释性** | 高 | 中 | 中 |\n"
+    
+    return report
+
+# 使用示例
+recommendation = generate_mechanism_recommendation(comparison)
+print(recommendation)
 ```
 
 ---
