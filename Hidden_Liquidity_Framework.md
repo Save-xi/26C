@@ -1,6 +1,6 @@
-# Hidden Liquidity Inference Framework v3.3
+# Hidden Liquidity Inference Framework v3.4
 
-> v3.3: 彻底修复`_bottom2`键冲突和索引碰撞问题，代码可直接运行。
+> v3.4: 添加空集/除零保护、统一机制判定函数、添加feasibility_rate指标。
 
 ---
 
@@ -372,7 +372,7 @@ def extract_elimination_events(df, season):
                 eliminated_list.append(name)
         
         eliminated = eliminated_list[0] if len(eliminated_list) == 1 else (eliminated_list if eliminated_list else None)
-        mechanism = get_mechanism(season)
+        mechanism = detect_mechanism(season, week)  # 使用统一的机制判定函数
         
         events.append({
             'season': season,
@@ -386,13 +386,30 @@ def extract_elimination_events(df, season):
     
     return events
 
-def get_mechanism(season: int) -> str:
+def detect_mechanism(season: int, week: int = 1) -> str:
+    """
+    统一机制判定函数（替代旧的get_mechanism）
+    
+    Args:
+        season: 赛季编号
+        week: 周次（用于S28+早周判定）
+    
+    Returns:
+        'Rank', 'Percent', 或 'Rank+JudgePick'
+    """
     if season <= 2:
-        return 'Rank'
+        return 'Rank'  # S1-2: Judge排名+粉丝排名
     elif season <= 27:
-        return 'Percent'
+        return 'Percent'  # S3-27: Judge百分比+粉丝百分比
     else:
-        return 'Rank+JudgePick'
+        # S28+: Rank+JudgePick，但前2周可能仍是旧制
+        if week <= 2:
+            return 'Rank'  # 早周仍使用纯Rank
+        else:
+            return 'Rank+JudgePick'
+
+# 向后兼容别名
+get_mechanism = lambda season: detect_mechanism(season, week=99)
 ```
 
 ### 2.2 Bottom2 提取（S28+）
@@ -949,12 +966,15 @@ def compute_elimination_rank(
     fan_rank: Dict[str, int],
     judge_rank: Dict[str, int],
     alive: Optional[set] = None
-) -> str:
-    """Rank模式：返回综合排名最差的选手（过滤辅助键）"""
+) -> Optional[str]:
+    """Rank模式：返回综合排名最差的选手（过滤辅助键，空集保护）"""
     valid_keys = set(judge_rank.keys())
     if alive:
         valid_keys = valid_keys & set(alive)
-    filtered = {c: fan_rank[c] for c in fan_rank if c in valid_keys}
+    # 过滤辅助键和不在judge_rank中的键
+    filtered = {c: fan_rank[c] for c in fan_rank if c in valid_keys and not str(c).startswith('_')}
+    if not filtered:
+        return None  # 空集保护
     combined = {c: judge_rank[c] + filtered[c] for c in filtered}
     return max(combined.keys(), key=lambda c: combined[c])
 
@@ -962,13 +982,18 @@ def compute_elimination_percent(
     vote_share: Dict[str, float],
     judge_scores: Dict[str, float],
     alive: Optional[set] = None
-) -> str:
-    """Percent模式：返回综合得分最低的选手（过滤辅助键）"""
+) -> Optional[str]:
+    """Percent模式：返回综合得分最低的选手（过滤辅助键，空集/除零保护）"""
     valid_keys = set(judge_scores.keys())
     if alive:
         valid_keys = valid_keys & set(alive)
-    filtered = {c: vote_share[c] for c in vote_share if c in valid_keys}
+    # 过滤辅助键
+    filtered = {c: vote_share[c] for c in vote_share if c in valid_keys and not str(c).startswith('_')}
+    if not filtered:
+        return None  # 空集保护
     total_j = sum(judge_scores[c] for c in filtered)
+    if total_j < 1e-10:
+        return None  # 除零保护
     combined = {c: judge_scores[c]/total_j + filtered[c] for c in filtered}
     return min(combined.keys(), key=lambda c: combined[c])
 
@@ -1045,6 +1070,9 @@ def evaluate_model(
             else:
                 pred_elim = compute_elimination_rank(sample, judge_rank, alive)
             
+            # 空集保护：若calc返回None则跳过该样本
+            if pred_elim is None:
+                continue
             if pred_elim in elim_counts:
                 elim_counts[pred_elim] += 1
         
@@ -1068,12 +1096,15 @@ def evaluate_model(
     if n_skipped > 0:
         warnings.warn(f"评估时跳过了{n_skipped}周（无后验样本）")
     
+    n_attempted = n_total + n_skipped
+    
     return {
         'accuracy': correct / n_total if n_total > 0 else 0,
         'brier_score': brier_sum / n_total if n_total > 0 else 1,
         'log_loss': log_loss_sum / n_total if n_total > 0 else 10,
         'n_weeks': n_total,
-        'n_skipped': n_skipped
+        'n_skipped': n_skipped,
+        'feasibility_rate': n_total / n_attempted if n_attempted > 0 else 0  # 可行解存在率
     }
 
 def compute_elimination_judgepick_with_bottom2(
